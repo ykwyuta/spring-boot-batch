@@ -74,3 +74,28 @@
 設計レビュー（`reviews/02_design-review.md`指摘事項2）を踏まえ、`null`を渡した場合の防御的な
 デフォルト値生成ロジック（A7）と、空リストが明示された場合にバリデーション・存在検証ループが
 0回実行されて素通りする経路（A8）を区別して検証する。
+
+## 3. `AsyncTaskExecutionService.executeAsync`（非同期実行本体）のテストケース（分岐 B1〜B6）
+
+`executeAsync(taskId, taskName, parameters, inputFilePaths)`を、`@Async`によるスレッドプール経由
+ではなく**同期的に直接呼び出す**ことで、状態ストアへの反映を検証する（設計書「4.4」のメソッド内
+処理ロジック自体はディスパッチ方式と独立して検証可能なため）。事前に`AsyncTaskExecutionStateStore`
+に対象`taskId`の`PENDING`レコードを`save`しておき、`executeAsync`呼び出し後の状態ストアの内容を
+検証する。既存`TaskExecutionService`のデモ用タスク名（`sample-task`/`task-business-failure`/
+`task-unexpected-error`）をそのまま再利用し、各分岐を再現する。
+
+| ケースID | 対象分岐 | 条件式・分岐先 | 入力条件 | 期待結果 |
+| :-- | :-- | :-- | :-- | :-- |
+| AE-01 | T2（RUNNINGへの遷移） | `executeAsync`呼び出し直後、`TaskExecutionService.execute`呼び出し前に状態ストアが`RUNNING`に更新される | `taskName="sample-task"`で`executeAsync`を呼び出す直前・直後の状態ストアの値をタイミングをずらして確認する（または`TaskExecutionService`をモック化し、`execute`呼び出し時点でのストアの状態を検証する） | `TaskExecutionService.execute`呼び出し時点で状態ストアの`status`が`RUNNING`になっている |
+| AE-02 | B1（正常終了） | `TaskExecutionService.execute(...)`が正常終了し`TaskExecutionResult`を返す場合、`SUCCEEDED`に遷移する | `taskName="sample-task"`、`parameters={}`、`inputFilePaths=[]`で`executeAsync`を呼び出す | 状態ストアの当該`taskId`のレコードが`status=SUCCEEDED`、`message="task executed successfully"`に更新される |
+| AE-03 | B2（TASK_NOT_FOUND） | `TaskExecutionService.execute(...)`が`TaskExecutionException`（`errorCode=TASK_NOT_FOUND`）をスローする場合、`FAILED`に遷移する | `taskName="unknown-task"`（既存`TaskExecutionService`が未知のタスク名として扱う値）で`executeAsync`を呼び出す | 状態ストアの当該`taskId`のレコードが`status=FAILED`、`errorCode="TASK_NOT_FOUND"`に更新される。`AsyncTaskRecord.errorCode`は内部状態としてのみ保持され、対応する`AsyncTaskStatusResponse`には`errorCode`フィールド自体が存在しないこと（設計書「8.2」「5.5」の方針）も合わせて確認する |
+| AE-04 | B3（TASK_EXECUTION_FAILED） | `TaskExecutionService.execute(...)`が`TaskExecutionException`（`errorCode=TASK_EXECUTION_FAILED`）をスローする場合、`FAILED`に遷移する | `taskName=TaskExecutionService.TASK_NAME_BUSINESS_FAILURE`（`task-business-failure`）で`executeAsync`を呼び出す | 状態ストアの当該`taskId`のレコードが`status=FAILED`、`errorCode="TASK_EXECUTION_FAILED"`、`message`に前提条件不成立の旨が設定される |
+| AE-05 | B4（想定外の実行時例外） | `TaskExecutionService.execute(...)`が想定外の実行時例外（`NullPointerException`等）をスローする場合、ログ出力後`FAILED`に遷移する | `taskName=TaskExecutionService.TASK_NAME_UNEXPECTED_ERROR`（`task-unexpected-error`）で`executeAsync`を呼び出す | 状態ストアの当該`taskId`のレコードが`status=FAILED`、`errorCode="INTERNAL_ERROR"`に更新される。`executeAsync`の呼び出し自体は例外をスローせず正常にreturnする（呼び出し元に伝播しないことを確認） |
+| AE-06 | B5（出力ファイルパスの決定・正常系） | `taskName=sample-task`の場合、`outputFilePaths`に1件のパスが設定される | AE-02と同条件で`executeAsync`を呼び出す | 状態ストアの当該`taskId`のレコードの`outputFilePaths`が1件の文字列（`/tmp/async-tasks/{taskId}/result.txt`形式）を含むリストになる |
+| AE-07 | B6（出力ファイルパスの決定・異常系） | B1以外（B2〜B4、処理が失敗したケース）の場合、`outputFilePaths`は空リストのまま | AE-03〜AE-05のいずれかと同条件で`executeAsync`を呼び出す | 状態ストアの当該`taskId`のレコードの`outputFilePaths`が空リストのままである |
+| AE-08（重要） | B3との対比: 同期API・非同期APIの挙動差異 | 既存同期API（`POST /internal/tasks/execute`）は業務的な失敗時に`422 TASK_EXECUTION_FAILED`を返すが、非同期APIは同じ業務的失敗（`task-business-failure`）が発生しても**HTTPレスポンスとしては`200 OK`＋`status=FAILED`を返し、422にはならない**（設計書「8.3」で明示された重要な差異） | （結合シナリオとして）同一の`taskName=task-business-failure`を(a)同期API`POST /internal/tasks/execute`、(b)非同期API`POST /internal/tasks/execute-async`に対して順に実行し、(b)は完了まで`GET /internal/tasks/{taskId}`をポーリングする | (a)はHTTPステータス`422`、`errorCode="TASK_EXECUTION_FAILED"`を返す。(b)は`POST`時点で`202`、ポーリング完了後の`GET`で`200 OK`、レスポンスボディが`status="FAILED"`、`message`に前提条件不成立の旨を含む（**422は一度も返らない**）。このケースは本テスト計画でC1網羅とは独立に設計レビュー指摘事項（02_design-review.md）への対応として必須で設けるケースである |
+
+注記: AE-08は単体テストの粒度を超えるため、セクション7「結合シナリオ」に実体を置き、本セクションで
+番号を予約する形にする（対象分岐B3・設計書8.3節の両方に対応付ける）。AE-01は厳密な競合条件の検証が
+難しいため、実装フェーズでは`TaskExecutionService`をモック化し`execute`呼び出し時にコールバックで
+状態ストアの値を確認する手法、または`Mockito`の`doAnswer`で検証する手法を用いることを想定する。
