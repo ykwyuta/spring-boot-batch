@@ -19,3 +19,11 @@
 | [subagents-creation.md](.claude/rules/subagents-creation.md) | サブエージェント（.claude/agents/）の作成・frontmatter のルール |
 | [logging.md](.claude/rules/logging.md) | スキル/エージェントの変更履歴ログ、作業履歴ログの記録ルール |
 | [deprecation.md](.claude/rules/deprecation.md) | スキル・エージェントの廃止（移動）手順 |
+| [docs-structure.md](.claude/rules/docs-structure.md) | 機能開発（方式検討・設計・実装・テスト）のドキュメント体系・配置ルール |
+
+## 機能開発の進め方
+
+方式検討→設計→実装→テスト（C1網羅）を行う機能開発タスクは、`/feature-dev-process` スキルを使って進める。
+このスキルは各工程を専用サブエージェント（`method-investigator` → `designer` → `implementer` → `test-engineer`）に委譲し、
+工程ごとに `phase-reviewer` サブエージェントでレビューを行ってから次工程に進める。
+ドキュメントの配置は [docs-structure.md](.claude/rules/docs-structure.md) に従う。
