@@ -361,3 +361,267 @@ public void executeAsync(UUID taskId, String taskName, Map<String, String> param
   処理を委ねず、必ず状態ストアの整合性を保つ。
 - 想定外の例外（`Exception` 全般）はサーバーログに `logger.error(...)` で記録する（既存の
   `GlobalExceptionHandler.handleUnexpectedException` と同様の方針をここでも踏襲する）。
+
+## 5. 公開インターフェース（REST API仕様）
+
+### 5.1 エンドポイント構成の決定
+
+3つの操作（非同期実行・ステータス確認・結果取得）に対し、**ステータス確認と結果取得を1本の
+エンドポイント（`GET /internal/tasks/{taskId}`）に統合する**。方式検討で「設計フェーズに委ねる」と
+された論点（01_method-study.mdの「ポーリング用APIの形」）への決定とその理由を以下に示す。
+
+**決定: 統合する（2エンドポイント構成: 実行受付 + 状態/結果取得）**
+
+| メソッド | パス | 概要 |
+| :-- | :-- | :-- |
+| `POST` | `/internal/tasks/execute-async` | 非同期実行をリクエストし、トラッキングキー（`taskId`）を即時返却する。 |
+| `GET` | `/internal/tasks/{taskId}` | `taskId` に対応するタスクの現在の状態を返す。完了済み（`SUCCEEDED`/`FAILED`）の場合は出力ファイルパス等の結果も同じレスポンスに含む。 |
+
+**統合する理由**
+
+1. `AsyncTaskRecord` が保持する情報（`status`/`outputFilePaths`/`message` 等）は元々1つのレコードで
+   あり、「ステータスのみ」と「結果を含む全体」を別レスポンスとして分ける必然性がない。未完了時は
+   `outputFilePaths` が空配列、`message` が `null` になるだけで、レスポンスの **形（JSON構造）は
+   完了前後で同一**にできる。bash側の実装（`jq` でのフィールド抽出）もエンドポイントを1つ覗くだけで
+   完結し、ポーリングと結果取得を同じURLに対して行えるため单純になる。
+2. RESTfulな観点からも、`taskId` は1つのリソース（非同期タスクの実行記録）を表しており、
+   `GET /internal/tasks/{taskId}` という単一リソース表現に対して時間経過に応じて内容（ステータス・
+   結果）が変化していくと捉える方が自然である（`/status` と `/result` のように同一リソースを
+   人為的に2つのサブパスへ分割する必要性が薄い）。
+3. 実装コストの観点でも、Controllerメソッド・Service呼び出し・例外ハンドリングを1本に集約できる
+   （2本に分けた場合、「未完了時に `/result` を呼んだら409を返す」という分岐をどちらのエンドポイントに
+   持たせるかという設計上の重複が生じる。1本に統合すれば「レスポンスの `status` フィールドで
+   未完了/完了済みを判別する」という単純な方針に一本化できる）。
+4. 完了前に「結果」を期待して呼び出した場合の挙動（方式検討の論点5）も、エンドポイントを分けず
+   `200 OK` ＋ `status: "RUNNING"`（結果フィールドはnull/空）で返す方針（「5.5」参照）にすることで、
+   ポーリングのたびに同じURLを叩き続けるだけで完了を待てるという単純な運用になる。
+
+   （結果取得を独立した `409 Conflict` で表現する選択肢も検討したが、「5.5」で述べる理由により
+   本設計では不採用とし、`200 OK` ＋ステータスフィールドでの表現を採用する。）
+
+### 5.2 非同期実行リクエストAPI
+
+```
+POST /internal/tasks/execute-async
+Content-Type: application/json
+```
+
+```json
+{
+  "taskName": "sample-task",
+  "parameters": {
+    "key1": "value1"
+  },
+  "inputFilePaths": ["/data/in1.csv", "/data/in2.csv"]
+}
+```
+
+| フィールド | 型 | 必須 | 説明・制約 |
+| :-- | :-- | :-- | :-- |
+| `taskName` | string | 必須 | 実行するタスクの識別子。既存同期APIと同じ制約（`@NotBlank`、最大100文字）。 |
+| `parameters` | object（`Map<String, String>`） | 任意 | タスクに渡す追加パラメータ。省略時は空Mapとして扱う（既存同期APIと同様）。 |
+| `inputFilePaths` | string配列（`List<String>`） | 任意（省略時は空リスト） | ローカルファイルシステム上の入力ファイルパス（絶対パス）。各要素は空文字・空白のみ不可（`@NotBlank` を要素に適用）。最大要素数は100件（`@Size(max=100)`、デモ用途として過大な配列を防ぐ）。 |
+
+**正常時レスポンス**
+
+```
+HTTP/1.1 202 Accepted
+Content-Type: application/json
+```
+
+```json
+{
+  "taskId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "status": "PENDING",
+  "acceptedAt": "2026-06-27T12:34:56.789Z"
+}
+```
+
+| フィールド | 型 | 説明 |
+| :-- | :-- | :-- |
+| `taskId` | string（UUID） | トラッキングキー。以後のステータス確認・結果取得APIで使用する。 |
+| `status` | string | `"PENDING"` 固定（受付直後の状態）。 |
+| `acceptedAt` | string（ISO-8601, Instant） | リクエスト受理時刻。 |
+
+- HTTPステータスは `202 Accepted` を採用する（既存同期APIの `200 OK` とは異なる。処理が完了して
+  いないことをHTTPセマンティクス上明示するため）。
+- `taskName`/`parameters` のバリデーション方針・エラーレスポンス形式は既存同期API（`400 Bad Request`、
+  `errorCode=VALIDATION_ERROR`）と同一にする。
+
+### 5.3 入力ファイルパスのバリデーション
+
+**決定: 入力ファイル存在チェックは、非同期実行リクエストAPIの受付処理内（`@Async` メソッドへの
+ディスパッチ前、同期的なControllerスレッド内）で行う。**
+
+理由:
+
+- 「ファイルが存在しない」というエラーは利用者（bash側）にとって即座にフィードバックされるべき
+  入力エラーである。非同期実行を開始してから（`RUNNING` に遷移してから）失敗が分かるのでは、
+  ポーリングのオーバーヘッドが無駄になり、UXが悪化する。
+- 既存同期API（`TaskExecutionService`）のバリデーション方針（Controller受付時にできるだけ早く
+  エラーを返す）とも一貫する。
+
+| 検証項目 | 検証タイミング | 不正時の挙動 |
+| :-- | :-- | :-- |
+| `inputFilePaths` の各要素が空文字・空白でないか | Bean Validation（`@Valid`、Controller受付時） | `400 Bad Request`（`errorCode=VALIDATION_ERROR`） |
+| `inputFilePaths` の要素数が100件以下か | Bean Validation（`@Valid`、Controller受付時） | `400 Bad Request`（`errorCode=VALIDATION_ERROR`） |
+| 各パスが指すファイルが実際にファイルシステム上に存在するか（`Files.exists(Path.of(path))`） | `AsyncTaskExecutionService` 内、状態ストアへの `PENDING` 登録前（`@Async` ディスパッチ前、同期処理） | `AsyncInputFileNotFoundException` をスロー → `GlobalExceptionHandler` が `404 Not Found`（`errorCode=INPUT_FILE_NOT_FOUND`）に変換 |
+| 各パスが指すファイルが通常ファイルであり、ディレクトリでないか（`Files.isRegularFile(path)`） | 上記と同様（存在確認と同時に判定） | 同上（`INPUT_FILE_NOT_FOUND`。「存在しない」と「ディレクトリである」を別エラーコードに分けるのは過剰と判断し、同一コードにまとめる） |
+
+- 複数の `inputFilePaths` のうちいずれか1つでも存在しない場合、最初に見つかった不正なパスを
+  メッセージに含めてエラーとする（全件のエラーをまとめて返す必要性は薄いと判断。デモ用途として
+  シンプルさを優先する）。
+- `inputFilePaths` が空リスト（省略時含む）の場合は、検証対象が存在しないため常に検証を通過する
+  （入力ファイルを使わないタスクも許容する。既存の `TaskExecutionService` の処理は実際には
+  ファイルI/Oを行わないデモ実装のため、入力ファイルパスの有無自体は現状の業務処理に影響しない。
+  あくまで「複数ファイルパスを受け渡せること」自体をデモするための仕組みとして設計する）。
+
+### 5.4 出力ファイルパスの決定方式
+
+**決定: 出力ファイルパスは Service 側（`AsyncTaskExecutionService`）が自律的に決定し、結果取得
+レスポンスで返却する（リクエスト側での指定は不要）。** 方式検討で示された2方式
+（(i) Service自律決定 / (ii) リクエスト時指定）のうち、(i) を採用する。
+
+**採用理由**
+
+1. (ii)（リクエスト時指定）を採用する場合、出力先ディレクトリの存在検証（書き込み権限確認含む）・
+   既存ファイルの上書き可否といった追加の分岐が必要になる（方式検討レビューでも指摘された懸念）。
+   現状の `TaskExecutionService.execute(...)` は実際にはファイルへの書き込みを行わないデモ実装
+   であり、「出力先を受け取って書き込む」という実体がない状態でこれらの分岐を設計・実装することは
+   オーバーエンジニアリングになる。
+2. (i) であれば、出力ファイルパスはデモ実装として `AsyncTaskExecutionService` が固定的な命名規則
+   （例: `{システム一時ディレクトリ}/async-tasks/{taskId}/output.txt` 等の形式、または
+   既存の `TaskExecutionResult.message()` をそのまま使い実ファイルは生成しない）で決定でき、
+   バリデーション・エラー表現を追加する必要がない。利用者（bash側）は結果取得APIのレスポンスに
+   含まれる `outputFilePaths` を読み取るだけでよく、実装・運用の両面でシンプルになる。
+3. 将来、実際にファイル書き込みを行う具体的なタスクが追加された場合でも、(i) の方針（Service側が
+   決定したパスを返す）は変更不要であり、`AsyncTaskExecutionService` 内の出力パス決定ロジックのみを
+   拡張すればよい。
+
+**出力ファイルパスの具体的な決定ロジック（デモ実装）**
+
+- `AsyncTaskExecutionService` は、`taskName` が `sample-task` の場合、`outputFilePaths` として
+  `List.of("/tmp/async-tasks/" + taskId + "/result.txt")` 形式の1要素のリストを生成する
+  （実際のファイル書き込みは行わない。既存の `TaskExecutionService` がデモ実装のため、本機能でも
+  同様にパス文字列の生成のみをデモする）。
+- `taskName` が `task-business-failure`/`task-unexpected-error` の場合は、処理自体が失敗するため
+  `outputFilePaths` は生成されない（空リストのまま `FAILED` に遷移する）。
+- 上記はあくまでデモ用の固定ロジックであり、本書はその実装方針（Service側で決定し、固定の命名規則を
+  用いる）を確定することが目的である。具体的なパス生成ロジックは実装フェーズで詳細化してよい。
+
+### 5.5 ステータス確認・結果取得API（統合）
+
+```
+GET /internal/tasks/{taskId}
+```
+
+**正常時レスポンス（共通フォーマット、状態によりフィールドの値が変化する）**
+
+```
+HTTP/1.1 200 OK
+Content-Type: application/json
+```
+
+```json
+{
+  "taskId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "status": "RUNNING",
+  "taskName": "sample-task",
+  "message": null,
+  "outputFilePaths": [],
+  "createdAt": "2026-06-27T12:34:56.789Z",
+  "updatedAt": "2026-06-27T12:34:57.001Z"
+}
+```
+
+完了後（`SUCCEEDED`）の例:
+
+```json
+{
+  "taskId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "status": "SUCCEEDED",
+  "taskName": "sample-task",
+  "message": "task executed successfully",
+  "outputFilePaths": ["/tmp/async-tasks/3fa85f64-5717-4562-b3fc-2c963f66afa6/result.txt"],
+  "createdAt": "2026-06-27T12:34:56.789Z",
+  "updatedAt": "2026-06-27T12:35:10.222Z"
+}
+```
+
+| フィールド | 型 | 説明 |
+| :-- | :-- | :-- |
+| `taskId` | string（UUID） | リクエストされたトラッキングキー（そのまま返す）。 |
+| `status` | string | `PENDING`/`RUNNING`/`SUCCEEDED`/`FAILED` のいずれか。 |
+| `taskName` | string | 実行された（実行中の）タスク名。 |
+| `message` | string（nullable） | 完了時のみ値を持つ。`SUCCEEDED` 時は `TaskExecutionResult.message()`、`FAILED` 時は失敗理由。未完了時は `null`。 |
+| `outputFilePaths` | string配列 | `SUCCEEDED` 時のみ値を持つ（「5.4」参照）。未完了・`FAILED` 時は空配列。 |
+| `createdAt` | string（ISO-8601, Instant） | 非同期実行リクエストを受理した時刻。 |
+| `updatedAt` | string（ISO-8601, Instant） | 状態が最後に更新された時刻。 |
+
+**`status=FAILED` の場合のレスポンス例**
+
+```json
+{
+  "taskId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "status": "FAILED",
+  "taskName": "task-business-failure",
+  "message": "precondition not satisfied for task: task-business-failure",
+  "outputFilePaths": [],
+  "createdAt": "2026-06-27T12:34:56.789Z",
+  "updatedAt": "2026-06-27T12:34:58.500Z"
+}
+```
+
+- `errorCode`（`TASK_EXECUTION_FAILED`/`INTERNAL_ERROR` 等）はこのレスポンスには含めない方針とする。
+  理由: 本APIは「タスク自体の処理結果」を表現するレスポンスであり、HTTPレベルのエラーレスポンス
+  （`ErrorResponse` 形式）とは概念が異なる。`status=FAILED` 自体がエラーを表しており、詳細は
+  `message` で表現すれば十分と判断する（`errorCode` を含めたい場合は実装フェーズで `AsyncTaskRecord`
+  にすでに保持しているフィールドをレスポンスDTOに追加するだけで対応できるため、設計上の制約には
+  ならない）。
+
+**完了前に呼び出した場合の挙動（方式検討の論点5への決定）**
+
+- `status` が `PENDING`/`RUNNING` の場合も **`200 OK`** を返す（`409 Conflict` 等のエラー扱いに
+  しない）。理由は「5.1」で述べた通り、本APIを「現在の状態を返す」単一の取得APIとして統合した
+  ため、未完了であること自体は正常な応答（まだ終わっていないという正しい情報）であり、HTTP的な
+  異常とはみなさない。bash側は `status` フィールドの値でループを継続するかを判断する
+  （方式検討の「bash運用イメージ」を参照、同方針を維持する）。
+- この設計判断により、「3a. 入力ファイルの扱い」「5. 完了前に結果取得APIを呼んだ場合の挙動」という
+  ユーザー要望上の論点に対し、本書は「エンドポイントは1本、ステータスで状態を表現し、未完了は
+  200 OKで表現する」という一貫した回答を与える。
+
+### 5.6 公開メソッドシグネチャ
+
+```java
+// AsyncTaskExecutionController
+@PostMapping("/internal/tasks/execute-async")
+public ResponseEntity<AsyncTaskExecutionAcceptedResponse> executeAsync(
+        @Valid @RequestBody AsyncTaskExecutionRequest request) { ... }
+
+@GetMapping("/internal/tasks/{taskId}")
+public ResponseEntity<AsyncTaskStatusResponse> getStatus(@PathVariable String taskId) { ... }
+```
+
+```java
+// AsyncTaskExecutionService
+public UUID acceptAsyncExecution(String taskName, Map<String, String> parameters,
+                                  List<String> inputFilePaths) { ... }
+// 入力ファイル存在検証、PENDING登録、@Asyncメソッドへのディスパッチを行い、taskIdを返す。
+
+@Async("asyncTaskExecutor")
+public void executeAsync(UUID taskId, String taskName, Map<String, String> parameters,
+                          List<String> inputFilePaths) { ... }
+// 実際の非同期実行本体（「4.4」参照）。
+
+public AsyncTaskRecord getStatus(UUID taskId) { ... }
+// 状態ストアからレコードを取得する。存在しない場合はAsyncTaskNotFoundExceptionをスローする。
+```
+
+```java
+// AsyncTaskExecutionStateStore
+public void save(AsyncTaskRecord record) { ... }
+public Optional<AsyncTaskRecord> find(UUID taskId) { ... }
+public AsyncTaskRecord update(UUID taskId, UnaryOperator<AsyncTaskRecord> updater) { ... }
+public void remove(UUID taskId) { ... }
+public void removeIfOlderThan(Instant threshold) { ... }
+```
