@@ -62,7 +62,7 @@
   （トラッキングキー不正等）にどう対応するかを「8. エラーハンドリング方針」で確定する。
 - テストは `@WebMvcTest` + `MockitoBean`（Controller）、プレーンJUnit（Service）、`MockHttpServletRequest`
   相当（Interceptor）、`@RestControllerAdvice` の単体呼び出し（GlobalExceptionHandler）という構成。
-  本書はテスト計画工程（`03_test-plan.md`）に向けて分岐を明示する（後述「7. 異常系の分岐」）。
+  本書はテスト計画工程（`03_test-plan.md`）に向けて分岐を明示する（後述「9. 異常系の分岐一覧」）。
 
 ## 2. パッケージ構成・クラス構成
 
@@ -99,7 +99,7 @@ src/main/java/com/example/demo/
         ├── GlobalExceptionHandler.java                    (既存。新規ExceptionHandlerメソッドのみ追加、既存メソッドは変更なし)
         ├── ErrorResponse.java                             (既存、変更なし)
         ├── AsyncTaskNotFoundException.java               # 新規。不正・未知のtaskId指定時の例外
-        └── AsyncTaskNotCompletedException.java           # 新規。未完了タスクへの結果取得時の例外
+        └── AsyncInputFileNotFoundException.java          # 新規。入力ファイル不存在時の例外
 ```
 
 新規クラスは既存の命名規約（`TaskExecutionXxx`）と区別できるよう `AsyncTaskExecutionXxx`/`AsyncTaskXxx`
@@ -121,8 +121,8 @@ src/main/java/com/example/demo/
 | `AsyncTaskExecutionRequest` | 非同期実行リクエストDTO。`taskName`（既存と同形式）、`parameters`（既存と同形式）、`inputFilePaths: List<String>`（新規）を保持する。 |
 | `AsyncTaskExecutionAcceptedResponse` | 非同期実行受付時（`202 Accepted`）のレスポンスDTO。`taskId`・`status`（`PENDING` 固定）・`acceptedAt` を保持する。 |
 | `AsyncTaskStatusResponse` | ステータス確認・結果取得の両エンドポイントで共用するレスポンスDTO。`taskId`/`status`/`taskName`/`message`/`outputFilePaths`/`createdAt`/`updatedAt` を保持し、未完了時は `outputFilePaths`/`message` が `null`（または空配列）になる（詳細は「5. 公開インターフェース」）。 |
-| `AsyncTaskNotFoundException` | 存在しない・不正な形式の `taskId` が指定された場合にスローする例外。`GlobalExceptionHandler` で `404 Not Found` に変換する。 |
-| `AsyncTaskNotCompletedException` | 完了前（`PENDING`/`RUNNING`）のタスクに対して結果取得APIが呼ばれた場合にスローする例外。`GlobalExceptionHandler` で `409 Conflict` に変換する。 |
+| `AsyncTaskNotFoundException` | 存在しない・不正な形式の `taskId` が指定された場合にスローする例外。`GlobalExceptionHandler` で `404 Not Found` に変換する。なお、「5.5」の決定により未完了状態（`PENDING`/`RUNNING`）自体は正常応答（`200 OK`）として扱うため、「完了前の結果取得」を表す専用例外（`409 Conflict`用）は設けない。 |
+| `AsyncInputFileNotFoundException` | `inputFilePaths` のいずれかがファイルシステム上に存在しない場合にスローする例外。`GlobalExceptionHandler` で `404 Not Found` に変換する。 |
 
 Controller / Service / StateStore の3層分離により、以下を実現する。
 
@@ -701,12 +701,13 @@ bash(curl) -> LocalhostOnlyInterceptor.preHandle() -> AsyncTaskExecutionControll
   必要性は薄く、いずれも「指定したtaskIdに対応するタスクは見つからない」という共通の結果として
   扱うのが利用者にとって分かりやすいと判断する。
 - 既存の `TaskExecutionErrorCode.TASK_NOT_FOUND`（既存同期APIの「未知のtaskName」用）とは
-  **異なる例外クラス**（`AsyncTaskNotFoundException`）・**異なるenum**
-  （`AsyncTaskErrorCode.TASK_NOT_FOUND` 等、「8. エラーハンドリング方針」で定義）を用いる。
+  **異なる例外クラス**（`AsyncTaskNotFoundException`）を用いる。`errorCode`文字列としては同じ
+  `"TASK_NOT_FOUND"`を採用するが、これは`GlobalExceptionHandler`内でハードコードする文字列リテラル
+  であり、既存の`TaskExecutionErrorCode`enum自体は参照・拡張しない（「8.2」参照）。
   既存の `TaskExecutionErrorCode` を流用すると、本来関係のない既存同期API側の例外ハンドリング
   ロジック（`TaskExecutionException` を捕捉する既存の `@ExceptionHandler`）と意味的に混同し、
-  既存コードへの変更（enumへの値追加）が必要になってしまうため、新規にenum・例外クラスを追加する
-  方針を採る（既存コード非破壊の原則、「9. 既存コードへの影響範囲」参照）。
+  既存コードへの変更（enumへの値追加）が必要になってしまうため、新規に例外クラスを追加する
+  方針を採る（既存コード非破壊の原則、「11. 既存コードへの影響範囲」参照）。
 
 ## 7. 完了済みタスクの保持期間・削除方針
 
@@ -806,3 +807,142 @@ public ResponseEntity<ErrorResponse> handleRejectedExecutionException(RejectedEx
 この差分のうち「業務的な処理失敗が422ではなく`200 OK`＋`status=FAILED`として表現される」点は、
 同期API・非同期APIの設計思想の違いとして本書で明示しておくべき重要なポイントである
 （後続のテスト計画工程で、同期APIとの対比を明示したテストケースを設けることを推奨する）。
+
+## 9. 異常系の分岐一覧（C1網羅のための整理）
+
+後続のテスト計画工程（C1網羅）で利用できるよう、本機能で条件分岐が発生しうる箇所を一覧化する
+（既存の `docs/service-bash-invocation/02_design.md` の「4.2 異常系の分岐」と同様の形式）。
+
+### 9.1 非同期実行リクエストAPI（`POST /internal/tasks/execute-async`）の分岐
+
+| # | 分岐箇所 | 条件 | 挙動 | HTTPステータス |
+| :-- | :-- | :-- | :-- | :-- |
+| A0a | `LocalhostOnlyInterceptor`（既存・再利用） | リクエスト元IPが`127.0.0.1`/`::1` | 処理続行 | - |
+| A0b | `LocalhostOnlyInterceptor`（既存・再利用） | リクエスト元IPがローカルホスト以外 | 403を直接書き込み、Controller到達なし | 403 |
+| A1 | リクエストボディのデシリアライズ | JSONとして不正な形式 | `HttpMessageNotReadableException`を既存ハンドラが捕捉 | 400 |
+| A2 | `taskName`のバリデーション | null/空白のみ | バリデーションエラー | 400 |
+| A3 | `taskName`のバリデーション | 101文字以上 | バリデーションエラー | 400 |
+| A4 | `taskName`のバリデーション | 1〜100文字の妥当な値 | バリデーション通過 | - |
+| A5 | `inputFilePaths`の各要素のバリデーション | 要素に空文字・空白のみを含む | バリデーションエラー | 400 |
+| A6 | `inputFilePaths`の要素数バリデーション | 101件以上 | バリデーションエラー | 400 |
+| A7 | `inputFilePaths`の有無 | 省略（null） | 空リストとして扱い処理続行 | - |
+| A8 | `inputFilePaths`の有無 | 0件（空配列を明示） | 検証スキップで処理続行（A9以降に進まない） | - |
+| A9 | 入力ファイル存在検証（`Files.exists`/`isRegularFile`） | すべて存在する通常ファイル | 検証通過、PENDING登録へ進む | - |
+| A10 | 入力ファイル存在検証 | いずれか1つ以上が存在しない | `AsyncInputFileNotFoundException`をスロー | 404 |
+| A11 | 入力ファイル存在検証 | いずれか1つ以上がディレクトリ（通常ファイルでない） | `AsyncInputFileNotFoundException`をスロー | 404 |
+| A12 | `@Async`メソッドへのディスパッチ | スレッドプール・キューに空きがある | ディスパッチ成功、PENDINGレコードを保持したまま202を返す | 202 |
+| A13 | `@Async`メソッドへのディスパッチ | スレッドプール・キューが飽和 | `RejectedExecutionException`発生、登録済みPENDINGレコードを削除してから例外伝播 | 503 |
+| A14 | `parameters`の有無 | 省略 | 空Mapとして扱い処理続行 | - |
+| A15 | `parameters`の有無 | 指定されている | 指定値をそのままServiceに渡す | - |
+
+### 9.2 非同期実行本体（`@Async executeAsync`、HTTPレスポンスには現れないが状態遷移に影響する分岐）
+
+| # | 分岐箇所 | 条件 | 挙動（状態ストアへの反映） |
+| :-- | :-- | :-- | :-- |
+| B1 | `TaskExecutionService.execute(...)`の呼び出し結果 | 正常終了（`TaskExecutionResult`を返す） | `SUCCEEDED`に遷移。`message`/`outputFilePaths`を設定（T3） |
+| B2 | `TaskExecutionService.execute(...)`の呼び出し結果 | `TaskExecutionException`（`TASK_NOT_FOUND`）をスロー | `FAILED`に遷移。`errorCode=TASK_NOT_FOUND`、`message`を設定（T4） |
+| B3 | `TaskExecutionService.execute(...)`の呼び出し結果 | `TaskExecutionException`（`TASK_EXECUTION_FAILED`）をスロー | `FAILED`に遷移。`errorCode=TASK_EXECUTION_FAILED`、`message`を設定（T4） |
+| B4 | `TaskExecutionService.execute(...)`の呼び出し結果 | 想定外の実行時例外（`NullPointerException`等）をスロー | ログ出力後、`FAILED`に遷移。`errorCode=INTERNAL_ERROR`を設定（T4） |
+| B5 | 出力ファイルパスの決定（`taskName`に基づく分岐、「5.4」） | `taskName=sample-task`（正常系タスク） | `outputFilePaths`に1件のパスを設定 |
+| B6 | 出力ファイルパスの決定 | B1以外（B2〜B4、処理が失敗したケース） | `outputFilePaths`は空リストのまま |
+
+### 9.3 ステータス確認・結果取得API（`GET /internal/tasks/{taskId}`）の分岐
+
+| # | 分岐箇所 | 条件 | 挙動 | HTTPステータス |
+| :-- | :-- | :-- | :-- | :-- |
+| C0a | `LocalhostOnlyInterceptor`（既存・再利用） | リクエスト元IPが`127.0.0.1`/`::1` | 処理続行 | - |
+| C0b | `LocalhostOnlyInterceptor`（既存・再利用） | リクエスト元IPがローカルホスト以外 | 403を直接書き込み | 403 |
+| C1 | `taskId`パス変数のUUIDパース | 正しいUUID形式 | パース成功、状態ストア検索へ進む | - |
+| C2 | `taskId`パス変数のUUIDパース | 不正な形式（パース不能） | `AsyncTaskNotFoundException`をスロー | 404 |
+| C3 | 状態ストア検索（`stateStore.find`） | レコードが存在する | レコードを取得し、状態に応じたレスポンスを組み立てる | 200 |
+| C4 | 状態ストア検索 | レコードが存在しない（未発行、またはTTLで削除済み） | `AsyncTaskNotFoundException`をスロー | 404 |
+| C5 | レスポンス組み立て（`status`による分岐） | `status=PENDING` | `message=null`, `outputFilePaths=[]`で組み立て | 200 |
+| C6 | レスポンス組み立て | `status=RUNNING` | `message=null`, `outputFilePaths=[]`で組み立て | 200 |
+| C7 | レスポンス組み立て | `status=SUCCEEDED` | `message`/`outputFilePaths`を設定して組み立て | 200 |
+| C8 | レスポンス組み立て | `status=FAILED` | `message`を設定、`outputFilePaths=[]`で組み立て | 200 |
+
+### 9.4 状態ストア・保持期間に関する分岐
+
+| # | 分岐箇所 | 条件 | 挙動 |
+| :-- | :-- | :-- | :-- |
+| D1 | `AsyncTaskExecutionStateStore.removeIfOlderThan`（定期実行） | レコードの`status`が`SUCCEEDED`/`FAILED`かつ`updatedAt`がTTLを超過 | レコードを削除する |
+| D2 | 同上 | レコードの`status`が`PENDING`/`RUNNING`（TTL超過していても） | 削除しない |
+| D3 | 同上 | レコードの`status`が`SUCCEEDED`/`FAILED`だが`updatedAt`がTTL未満 | 削除しない |
+
+上記のうち、A0b, A1〜A3, A5, A6, A10, A11, A13, B2〜B4, C0b, C2, C4 が異常系、それ以外（A0a, A4,
+A7〜A9, A12, A14, A15, B1, B5, B6, C0a, C1, C3, C5〜C8, D1〜D3）が正常系またはニュートラルな分岐
+である。後続のテスト計画工程では、本表の各行に対応するテストケースを作成し、C1（分岐網羅）を
+満たすことを確認する。
+
+## 10. 設定項目
+
+`src/main/resources/application.properties` に以下のキーを新規追加する。
+
+```properties
+# 既存の設定（変更なし）
+spring.application.name=demo
+
+# 非同期タスク実行用スレッドプール設定（AsyncTaskExecutorConfigで読み込み）
+async-task.executor.core-pool-size=2
+async-task.executor.max-pool-size=4
+async-task.executor.queue-capacity=50
+
+# 完了済みタスクの状態保持期間（分）。経過後、AsyncTaskRetentionSchedulerが自動削除する。
+async-task.retention-minutes=30
+```
+
+| キー | 既定値 | 説明 | 対応するクラス |
+| :-- | :-- | :-- | :-- |
+| `async-task.executor.core-pool-size` | 2 | `ThreadPoolTaskExecutor` のコアプールサイズ（「4.2」） | `AsyncTaskExecutorConfig` |
+| `async-task.executor.max-pool-size` | 4 | `ThreadPoolTaskExecutor` の最大プールサイズ | `AsyncTaskExecutorConfig` |
+| `async-task.executor.queue-capacity` | 50 | `ThreadPoolTaskExecutor` のキュー長 | `AsyncTaskExecutorConfig` |
+| `async-task.retention-minutes` | 30 | 完了済みタスクの保持期間（分） | `AsyncTaskRetentionScheduler` |
+
+- `@ConfigurationProperties(prefix = "async-task")` を用いた設定クラス（`AsyncTaskProperties`、
+  `async`パッケージに新規追加）でこれらの値をバインドする方針とする（`build.gradle` に
+  `spring-boot-configuration-processor` が既に `annotationProcessor` として導入済みであり、追加の
+  依存は不要）。
+- 既存の `spring.application.name=demo` の行は変更しない。新規キーはファイル末尾に追記する形を
+  想定する（実装フェーズでの差分を最小化するため）。
+- いずれの設定値も既定値をコード上に持たせる（`application.properties` にキーが存在しなくても
+  動作する）ことで、設定ファイルへの追記漏れがあっても起動時エラーにならないようにする。
+
+## 11. 既存コードへの影響範囲
+
+| 対象 | 影響内容 |
+| :-- | :-- |
+| `TaskExecutionController.java` | **変更なし。** 既存の `POST /internal/tasks/execute` は本機能と無関係に動作し続ける。 |
+| `TaskExecutionService.java` | **変更なし。** `execute(String, Map<String,String>)` のシグネチャ・実装ともに変更せず、`AsyncTaskExecutionService` から呼び出し側として再利用するのみ。 |
+| `TaskExecutionResult.java` | **変更なし。** `AsyncTaskExecutionService` がそのまま戻り値として受け取る。 |
+| `TaskExecutionRequest.java` / `TaskExecutionResponse.java` | **変更なし。** 非同期API用には新規DTO（`AsyncTaskExecutionRequest`等）を別途作成するため、既存DTOへのフィールド追加は行わない。 |
+| `TaskExecutionException.java` / `TaskExecutionErrorCode.java` | **変更なし。** 新規の例外要因（トラッキングキー不正・入力ファイル不存在等）は新規クラス（`AsyncTaskNotFoundException`等）で表現し、既存enumへの値追加は行わない（「6.3」「8.2」参照）。 |
+| `GlobalExceptionHandler.java` | **既存メソッドは変更なし。新規`@ExceptionHandler`メソッドを3つ追加**（`handleAsyncTaskNotFoundException`/`handleAsyncInputFileNotFoundException`/`handleRejectedExecutionException`、「8.1」参照）。既存の4メソッドの動作・既存のテスト（`GlobalExceptionHandlerTest`）には影響しない。 |
+| `ErrorResponse.java` | **変更なし。** 新規例外のレスポンスも既存の `ErrorResponse`（`status`/`errorCode`/`message`/`timestamp`）形式をそのまま再利用する。 |
+| `LocalhostOnlyInterceptor.java` / `InternalApiWebConfig.java` | **変更なし。** `addPathPatterns("/internal/**")` の設定により、新規エンドポイント（`/internal/tasks/execute-async`、`/internal/tasks/{taskId}`）にも自動的に適用される。 |
+| `DemoApplication.java` | **変更なし。** `@SpringBootApplication` のコンポーネントスキャンが `com.example.demo` 配下を対象とするため、新規パッケージ `com.example.demo.task.async` は自動的にスキャン対象になる。`@EnableAsync`/`@EnableScheduling` は `AsyncTaskExecutorConfig` に付与するため、`DemoApplication` への追記は不要。 |
+| `build.gradle` | **変更なし。** `@Async`/`@EnableAsync`/`ThreadPoolTaskExecutor`/`@Scheduled` はいずれも `spring-context`（`spring-boot-starter-webmvc` が推移的に依存）に標準で含まれる。`@ConfigurationProperties` 用の `spring-boot-configuration-processor` も既に `annotationProcessor` として導入済み。新規ライブラリの追加は不要（方式検討の結論を最終確認した）。 |
+| `application.properties` | **新規キー4件を追記**（「10. 設定項目」参照）。既存キー（`spring.application.name`）は変更しない。 |
+| 既存テスト（`TaskExecutionControllerTest`/`TaskExecutionServiceTest`/`GlobalExceptionHandlerTest`/`LocalhostOnlyInterceptorTest`） | **変更なし。** いずれも既存クラスの振る舞いを検証するテストであり、既存クラスの実装が変わらないため、テストコードも変更不要（`GlobalExceptionHandlerTest`に新規メソッド用のテストケースを追加することはあるが、既存テストケースの修正は不要）。 |
+
+以上より、方式検討で前提とされた「既存の同期APIは変更せず残す」という要件を最終確認できた。
+既存クラスへの変更は `GlobalExceptionHandler.java` への**メソッド追加のみ**（既存メソッド・既存の
+動作は不変）であり、それ以外はすべて新規クラス・新規設定キーの追加で実現できる。
+
+## 12. まとめ
+
+- 新規パッケージ `com.example.demo.task.async`（Controller/Service/StateStore/Record/Status/Config）
+  を追加し、既存パッケージの `dto`/`exception` サブパッケージに新規DTO・例外クラスを追加する。
+- エンドポイントは2本: `POST /internal/tasks/execute-async`（実行受付、202）、
+  `GET /internal/tasks/{taskId}`（状態・結果取得、200。ステータス確認と結果取得を統合、「5.1」）。
+- 状態遷移は `PENDING -> RUNNING -> SUCCEEDED|FAILED` の4状態（終端状態は2つ）。
+- 非同期実行は `@Async("asyncTaskExecutor")` ＋専用 `ThreadPoolTaskExecutor`（コア2/最大4/キュー50）を
+  採用し、スレッドプール飽和時は `503 Service Unavailable` を返す（「4」）。
+- 入力ファイルの存在検証はリクエスト受付時（同期処理内）に行い、出力ファイルパスはService側が
+  自律的に決定する（リクエスト時指定は採用しない、「5.3」「5.4」）。
+- トラッキングキーが不正・不存在の場合は404、未完了状態での結果取得は200＋ステータス表現とし、
+  409は使用しない（「6.3」「5.5」）。
+- 完了済みタスクはTTL（既定30分）で自動削除し、明示的な削除APIは設けない（「7」）。
+- 既存クラスへの変更は `GlobalExceptionHandler` への3メソッド追加のみであり、既存の同期API・
+  既存テストへの影響はない（「11」）。
+- 異常系の分岐は本書「9」の表に網羅されており、後続のテスト計画（`03_test-plan.md`）でこの表を
+  ベースにC1網羅のテストケースを設計する。
