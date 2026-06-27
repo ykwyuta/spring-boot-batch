@@ -28,7 +28,7 @@
 `LocalhostOnlyInterceptor`（A0a/A0b）は既存同期APIのテスト（`LocalhostOnlyInterceptorTest`、
 `docs/service-bash-invocation/03_test-plan.md` IT-01〜IT-03）で既にC1網羅済みであり、`/internal/**`
 への適用方式自体（`InternalApiWebConfig`）に変更がないため、本セクションでは新規の単体テストを
-設けない（結合シナリオ「7」で疎通のみ確認する）。
+設けない（結合シナリオ「8」で疎通のみ確認する）。
 
 | ケースID | 対象分岐 | 条件式・分岐先 | 入力条件 | 期待結果 |
 | :-- | :-- | :-- | :-- | :-- |
@@ -95,7 +95,7 @@
 | AE-07 | B6（出力ファイルパスの決定・異常系） | B1以外（B2〜B4、処理が失敗したケース）の場合、`outputFilePaths`は空リストのまま | AE-03〜AE-05のいずれかと同条件で`executeAsync`を呼び出す | 状態ストアの当該`taskId`のレコードの`outputFilePaths`が空リストのままである |
 | AE-08（重要） | B3との対比: 同期API・非同期APIの挙動差異 | 既存同期API（`POST /internal/tasks/execute`）は業務的な失敗時に`422 TASK_EXECUTION_FAILED`を返すが、非同期APIは同じ業務的失敗（`task-business-failure`）が発生しても**HTTPレスポンスとしては`200 OK`＋`status=FAILED`を返し、422にはならない**（設計書「8.3」で明示された重要な差異） | （結合シナリオとして）同一の`taskName=task-business-failure`を(a)同期API`POST /internal/tasks/execute`、(b)非同期API`POST /internal/tasks/execute-async`に対して順に実行し、(b)は完了まで`GET /internal/tasks/{taskId}`をポーリングする | (a)はHTTPステータス`422`、`errorCode="TASK_EXECUTION_FAILED"`を返す。(b)は`POST`時点で`202`、ポーリング完了後の`GET`で`200 OK`、レスポンスボディが`status="FAILED"`、`message`に前提条件不成立の旨を含む（**422は一度も返らない**）。このケースは本テスト計画でC1網羅とは独立に設計レビュー指摘事項（02_design-review.md）への対応として必須で設けるケースである |
 
-注記: AE-08は単体テストの粒度を超えるため、セクション7「結合シナリオ」に実体を置き、本セクションで
+注記: AE-08は単体テストの粒度を超えるため、セクション8「結合シナリオ」に実体を置き、本セクションで
 番号を予約する形にする（対象分岐B3・設計書8.3節の両方に対応付ける）。AE-01は厳密な競合条件の検証が
 難しいため、実装フェーズでは`TaskExecutionService`をモック化し`execute`呼び出し時にコールバックで
 状態ストアの値を確認する手法、または`Mockito`の`doAnswer`で検証する手法を用いることを想定する。
@@ -118,7 +118,7 @@
 `AsyncTaskExecutionController`のController層テスト（C1/C2はUUIDパース失敗時の挙動、C3/C4は
 Service呼び出し結果の分岐）と、`AsyncTaskExecutionService.getStatus`のService層テスト（状態ストア
 検索とレスポンス組み立てに対応するC3〜C8）に分けて検証する。`C0a`/`C0b`はセクション1と同様の理由
-（既存`LocalhostOnlyInterceptor`の再利用）でセクション7の結合シナリオでのみ疎通確認する。
+（既存`LocalhostOnlyInterceptor`の再利用）でセクション8の結合シナリオでのみ疎通確認する。
 
 ### 5.1 `AsyncTaskExecutionController.getStatus` のテストケース（Controller層、分岐 C1, C2）
 
