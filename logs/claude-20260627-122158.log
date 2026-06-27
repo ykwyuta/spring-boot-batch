@@ -1,0 +1,17 @@
+日時: 2026-06-27 12:21:58
+指摘内容: 起動済のSpring BootのServiceをbashから実行できるようにする機能について、方式検討・設計・実装・テスト（C1網羅）を工程別レビュー付きで進めたい。そのためのプロジェクト推進スキルと、それから呼び出されるサブエージェントを定義し、ドキュメント体系を検討してCLAUDE.mdに反映してほしいという依頼。
+実施内容:
+  - ドキュメント体系ルール（.claude/rules/docs-structure.md）を新規作成し、docs/<feature-name>/ 配下に
+    方式検討・設計・テスト計画・各工程レビューを配置する構成を定義した。
+  - CLAUDE.md に docs-structure.md への参照と、feature-dev-process スキルを使った機能開発の進め方の節を追加した。
+  - プロジェクトを推進するスキル .claude/skills/feature-dev-process/SKILL.md を新規作成した（方式検討→設計→
+    テスト計画→実装→テスト実装の各工程をサブエージェントへ委譲し、工程ごとに phase-reviewer によるレビューを
+    経て次工程に進める運用を定義）。
+  - 各工程を担当するサブエージェントを新規作成した: method-investigator（方式検討）、designer（設計）、
+    implementer（実装）、test-engineer（テスト計画・テスト実装）、phase-reviewer（工程別レビュー）。
+  - スキル・サブエージェントの変更内容を .claude/logs/skills-20260627-122158.log に記録した。
+  - 実際の「Spring Boot Service を bash から実行する」機能そのものの方式検討・設計・実装・テストは、
+    今回作成した feature-dev-process スキルを使って別途進める想定（本作業はその推進基盤の整備）。
+変更ファイル: CLAUDE.md, .claude/rules/docs-structure.md, .claude/skills/feature-dev-process/SKILL.md,
+  .claude/agents/method-investigator.md, .claude/agents/designer.md, .claude/agents/implementer.md,
+  .claude/agents/test-engineer.md, .claude/agents/phase-reviewer.md, .claude/logs/skills-20260627-122158.log
