@@ -48,3 +48,29 @@
 注記: AC-11/AC-12はController層での例外伝播・ハンドラディスパッチの確認に主眼を置く（モックで
 例外を発生させる）。実際にファイル不存在・スレッドプール飽和を引き起こす条件そのものの検証は
 セクション2（Service単体テスト）で行う（A10/A11/A13本体の検証）。
+
+## 2. `AsyncTaskExecutionService.acceptAsyncExecution` のテストケース（分岐 A7〜A13）
+
+`AsyncTaskExecutionService`を直接インスタンス化し、Spring MVCコンテキストを起動せずに単体テスト
+する。`AsyncTaskExecutionStateStore`は実インスタンス（`new AsyncTaskExecutionStateStore()`）を
+用いて状態ストアへの登録・削除を実際に確認する。`@Async`によるスレッドプールへのディスパッチ自体
+（実際の別スレッド実行）はA12/A13の検証観点では「ディスパッチ呼び出しが例外をスローするか否か」
+のみが重要なため、テスト用に実行を即座に拒否する`Executor`（`RejectedExecutionException`を常に
+スローするスタブ）、および即時実行する`Executor`（`Runnable::run`、同期的に実行するスタブ）を
+注入してテストする（設計書「4.1」「4.3」のディスパッチ呼び出し自体の例外伝播を検証する。実際の
+非同期実行本体の状態遷移はセクション3で別途検証する）。
+
+| ケースID | 対象分岐 | 条件式・分岐先 | 入力条件 | 期待結果 |
+| :-- | :-- | :-- | :-- | :-- |
+| AS-01 | A7（inputFilePaths省略） | `inputFilePaths`がnull（省略）の場合、空リストとして扱い検証をスキップして処理続行する | `acceptAsyncExecution("sample-task", Map.of(), null)`を呼び出す（DTOバリデーションを経由しない直接呼び出しのため、Service側でのnull安全な扱いを確認） | 例外をスローせず`UUID`を返す。状態ストアに`PENDING`レコードが`inputFilePaths=[]`で登録される |
+| AS-02 | A8（inputFilePathsが空配列） | `inputFilePaths`が空リスト（`List.of()`）の場合、検証対象が存在しないため常に検証を通過する | `acceptAsyncExecution("sample-task", Map.of(), List.of())`を呼び出す | 例外をスローせず`UUID`を返す。状態ストアに`PENDING`レコードが`inputFilePaths=[]`で登録される（AS-01と処理結果は同一だが、入力経路（null→空リスト変換 / 空リストそのまま）が異なることを確認する） |
+| AS-03 | A9（すべて存在する通常ファイル） | `inputFilePaths`の各要素がすべて存在する通常ファイルの場合、検証を通過しPENDING登録へ進む | テスト用に一時ファイルを2つ作成（`@TempDir`）し、両方のパスを`inputFilePaths`に指定して`acceptAsyncExecution`を呼び出す | 例外をスローせず`UUID`を返す。状態ストアに`PENDING`レコードが当該`inputFilePaths`で登録される |
+| AS-04 | A10（いずれか1つ以上が存在しない） | `inputFilePaths`のいずれかのパスがファイルシステム上に存在しない場合 | 存在しないパス（例: `/no/such/file-<random>`）を含む`inputFilePaths`を指定して`acceptAsyncExecution`を呼び出す | `AsyncInputFileNotFoundException`がスローされる。状態ストアにレコードは残らない（PENDING登録自体が行われない） |
+| AS-05 | A11（いずれか1つ以上がディレクトリ） | `inputFilePaths`のいずれかのパスがディレクトリ（通常ファイルでない）の場合 | `@TempDir`が提供するディレクトリそのもののパスを`inputFilePaths`に指定して`acceptAsyncExecution`を呼び出す | `AsyncInputFileNotFoundException`がスローされる。状態ストアにレコードは残らない |
+| AS-06 | A12（ディスパッチ成功） | スレッドプール・キューに空きがある場合、ディスパッチ成功しPENDINGレコードを保持したまま`taskId`を返す | ディスパッチを即時実行する（または何もしない）スタブ`Executor`を注入し、存在検証を通過する条件で`acceptAsyncExecution`を呼び出す | 例外をスローせず`UUID`を返す。状態ストアに当該`taskId`の`PENDING`（または以後の遷移後の状態）レコードが存在する |
+| AS-07 | A13（ディスパッチ飽和） | スレッドプール・キューが飽和している場合、`RejectedExecutionException`が発生し登録済みPENDINGレコードを削除してから例外を再スローする | `Executor.execute(...)`が常に`RejectedExecutionException`をスローするスタブを注入し、存在検証を通過する条件で`acceptAsyncExecution`を呼び出す | `RejectedExecutionException`がスローされる。スロー後、当該`taskId`で状態ストアを検索すると`Optional.empty()`（登録したPENDINGレコードが削除されている） |
+
+注記: AS-01/AS-02はいずれも最終的に「検証スキップで処理続行」という同一の処理結果に収束するが、
+設計レビュー（`reviews/02_design-review.md`指摘事項2）を踏まえ、`null`を渡した場合の防御的な
+デフォルト値生成ロジック（A7）と、空リストが明示された場合にバリデーション・存在検証ループが
+0回実行されて素通りする経路（A8）を区別して検証する。
