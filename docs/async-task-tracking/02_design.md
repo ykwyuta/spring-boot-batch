@@ -731,3 +731,78 @@ bash(curl) -> LocalhostOnlyInterceptor.preHandle() -> AsyncTaskExecutionControll
 - ポーリング間隔の想定（方式検討のbash運用イメージでは2秒間隔）に対し、30分という保持期間は
   「ポーリングし損ねても十分に再確認できる」余裕を持たせた値である。
 - 削除APIを設けない方針により、API表面・エラーハンドリング（削除権限の有無等）を増やさずに済む。
+
+## 8. エラーハンドリング方針
+
+### 8.1 既存 `GlobalExceptionHandler` の拡張方針
+
+既存の `GlobalExceptionHandler`（`@RestControllerAdvice`）は、既存の `@ExceptionHandler` メソッド
+（`handleHttpMessageNotReadableException`/`handleValidationException`/
+`handleTaskExecutionException`/`handleUnexpectedException`）を**変更せず**、本機能用の新規
+`@ExceptionHandler` メソッドを**追加**する。`@RestControllerAdvice` は同一クラスに複数の
+`@ExceptionHandler` を持てるため、既存メソッドへの影響はない。
+
+```java
+// GlobalExceptionHandler に追加するメソッド（既存メソッドは変更しない）
+
+@ExceptionHandler(AsyncTaskNotFoundException.class)
+public ResponseEntity<ErrorResponse> handleAsyncTaskNotFoundException(AsyncTaskNotFoundException ex) {
+    return ResponseEntity.status(HttpStatus.NOT_FOUND)
+            .body(new ErrorResponse("ERROR", "TASK_NOT_FOUND", ex.getMessage(), Instant.now()));
+}
+
+@ExceptionHandler(AsyncInputFileNotFoundException.class)
+public ResponseEntity<ErrorResponse> handleAsyncInputFileNotFoundException(AsyncInputFileNotFoundException ex) {
+    return ResponseEntity.status(HttpStatus.NOT_FOUND)
+            .body(new ErrorResponse("ERROR", "INPUT_FILE_NOT_FOUND", ex.getMessage(), Instant.now()));
+}
+
+@ExceptionHandler(RejectedExecutionException.class)
+public ResponseEntity<ErrorResponse> handleRejectedExecutionException(RejectedExecutionException ex) {
+    logger.error("async task thread pool saturated", ex);
+    return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+            .body(new ErrorResponse("ERROR", "ASYNC_EXECUTOR_BUSY", "server is busy, please retry later", Instant.now()));
+}
+```
+
+- 既存の `handleUnexpectedException`（`Exception.class` を捕捉する最後段のハンドラ）は変更しない。
+  `RejectedExecutionException` を専用ハンドラで捕捉するのは、503という特定の意味を持つステータスを
+  返すために必要な最小限の追加である（専用ハンドラがなければ既存の `handleUnexpectedException` に
+  捕捉され500を返してしまうため、503を返すには新規ハンドラの追加が必須）。
+- `@ExceptionHandler` メソッドはSpringが例外の型に基づき最も具体的なハンドラへディスパッチするため、
+  メソッドの追加順序や既存メソッドとの記述順は実行時の挙動に影響しない。
+
+### 8.2 新規例外クラス・errorCode一覧
+
+| 例外クラス | パッケージ | 用途 | 対応するHTTPステータス | `errorCode` |
+| :-- | :-- | :-- | :-- | :-- |
+| `AsyncTaskNotFoundException` | `task.exception` | 不正な形式の`taskId`、または存在しない`taskId`が指定された場合 | 404 | `TASK_NOT_FOUND` |
+| `AsyncInputFileNotFoundException` | `task.exception` | `inputFilePaths` のいずれかがファイルシステム上に存在しない場合 | 404 | `INPUT_FILE_NOT_FOUND` |
+| `RejectedExecutionException`（標準ライブラリ、`java.util.concurrent`） | （標準ライブラリ、新規クラスは作らない） | スレッドプール飽和時 | 503 | `ASYNC_EXECUTOR_BUSY` |
+
+- いずれも `RuntimeException` を継承する非チェック例外とし、Controller・Service層に
+  `try-catch` を書かせず `GlobalExceptionHandler` に集約する方針を既存同期APIから踏襲する。
+- 既存の `TaskExecutionException`/`TaskExecutionErrorCode` は**変更しない**（「6.3」で述べた通り、
+  既存enumに値を追加せず新規クラスを用意することで非破壊を保つ）。
+- `AsyncTaskNotFoundException`/`AsyncInputFileNotFoundException` はいずれも単純なメッセージのみを
+  持つ例外とし、既存の `TaskExecutionException` のような `errorCode` フィールドは持たせない
+  （1例外クラス = 1エラーコードの対応であり、`TaskExecutionException` のように複数のエラーコードを
+  1クラスで表現する必要がないため、よりシンプルな設計にする）。
+
+### 8.3 既存同期APIのエラーハンドリングとの差分まとめ
+
+| 観点 | 既存同期API | 非同期API（本機能） |
+| :-- | :-- | :-- |
+| バリデーションエラー（400） | `MethodArgumentNotValidException` を`GlobalExceptionHandler`が捕捉 | 同様（`AsyncTaskExecutionRequest` の `@Valid` 違反に対して同一の仕組みを再利用） |
+| JSONパース不能（400） | `HttpMessageNotReadableException` | 同様（共通の既存ハンドラを再利用） |
+| タスク名不明（既存同期APIのみ） | `TaskExecutionException`（`TASK_NOT_FOUND`）→ 404 | 非同期APIでも`taskName`不明は同じ `TaskExecutionException` が `executeAsync` 内でスローされるが、これは**非同期スレッド内**で発生するため状態ストアの`FAILED`に反映される（HTTPレスポンスとしては伝播しない。「6.1」手順8b参照）。 |
+| 業務的な処理失敗（既存同期APIのみ） | `TaskExecutionException`（`TASK_EXECUTION_FAILED`）→ 422 | 同上。非同期スレッド内で`FAILED`として状態ストアに反映され、HTTPレスポンスとしては`getStatus`時に`200 OK`＋`status=FAILED`として表現される（**422は返らない**。これは同期APIと非同期APIの本質的な違いであり、後続のテスト計画で明記すべき重要な分岐）。 |
+| トラッキングキー不正・不存在（非同期APIのみ） | （存在しない概念） | `AsyncTaskNotFoundException` → 404 |
+| 入力ファイル不存在（非同期APIのみ） | （存在しない概念） | `AsyncInputFileNotFoundException` → 404 |
+| スレッドプール飽和（非同期APIのみ） | （存在しない概念） | `RejectedExecutionException` → 503 |
+| ローカルホスト以外からのアクセス（403） | `LocalhostOnlyInterceptor` | 同一の仕組みをそのまま再利用（変更なし） |
+| 想定外の例外（500） | `handleUnexpectedException` | 非同期実行リクエストAPI受付処理中（ファイル検証等の同期処理部分）で発生した場合のみHTTPレスポンスとして500になる。`executeAsync`内（非同期スレッド）で発生した場合は状態ストアの`FAILED`（`errorCode=INTERNAL_ERROR`）に反映され、HTTPレスポンスとしては`200 OK`＋`status=FAILED`になる。 |
+
+この差分のうち「業務的な処理失敗が422ではなく`200 OK`＋`status=FAILED`として表現される」点は、
+同期API・非同期APIの設計思想の違いとして本書で明示しておくべき重要なポイントである
+（後続のテスト計画工程で、同期APIとの対比を明示したテストケースを設けることを推奨する）。
