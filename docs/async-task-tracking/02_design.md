@@ -625,3 +625,109 @@ public AsyncTaskRecord update(UUID taskId, UnaryOperator<AsyncTaskRecord> update
 public void remove(UUID taskId) { ... }
 public void removeIfOlderThan(Instant threshold) { ... }
 ```
+
+## 6. 処理フロー
+
+### 6.1 非同期実行リクエストのシーケンス（正常系）
+
+```
+bash(curl) -> LocalhostOnlyInterceptor.preHandle() -> AsyncTaskExecutionController.executeAsync()
+  0. Interceptorがリクエスト元IPを判定（既存の仕組みをそのまま利用、変更なし）
+       - 127.0.0.1 または ::1 -> true を返し処理続行
+       - それ以外 -> 403（Controller到達なし）
+  1. Spring MVC が application/json のリクエストボディを AsyncTaskExecutionRequest にデシリアライズ
+  2. @Valid によるBean Validationを実行
+       - taskName が null/空白、101文字以上 -> バリデーションエラー（400）
+       - inputFilePaths の要素に空文字・空白を含む、101件以上 -> バリデーションエラー（400）
+  3. Controller が AsyncTaskExecutionService.acceptAsyncExecution(...) を呼び出す
+  4. Service内処理（同期、Controllerを呼び出したスレッド内で実行）:
+       a. inputFilePaths の各要素についてファイル存在確認（Files.exists/isRegularFile）
+            - すべて存在する（またはinputFilePathsが空） -> 処理続行
+            - いずれかが存在しない/ディレクトリである -> AsyncInputFileNotFoundExceptionをスロー（404）
+       b. taskId(UUID.randomUUID())を発行し、状態ストアにPENDINGレコードをsave
+       c. @Asyncメソッド（executeAsync）をディスパッチ（asyncTaskExecutor経由）
+            - ディスパッチ成功 -> taskIdをControllerに返す
+            - スレッドプール飽和でRejectedExecutionException -> 直前に登録したレコードをstateStoreから
+              remove、例外を再スロー（503、詳細は7番）
+  5. Controller が taskId を AsyncTaskExecutionAcceptedResponse に変換
+  6. HTTP 202 Accepted としてJSONレスポンスを返却（taskId, status=PENDING, acceptedAt）
+
+--- （非同期、別スレッドで実行。Controllerはすでに202を返して終わっている） ---
+
+asyncTaskExecutor配下のスレッド -> AsyncTaskExecutionService.executeAsync(taskId, ...)
+  7. 状態ストアをRUNNINGに更新（T2）
+  8. 既存の TaskExecutionService.execute(taskName, parameters) を呼び出す
+       a. 正常終了 -> TaskExecutionResultを取得
+            -> 出力ファイルパスを決定（5.4のロジック）
+            -> 状態ストアをSUCCEEDEDに更新（T3, message/outputFilePathsを設定）
+       b. TaskExecutionExceptionをスロー -> 状態ストアをFAILEDに更新（T4, errorCode/messageを設定）
+       c. 想定外の例外をスロー -> ログ出力 -> 状態ストアをFAILEDに更新（T4, errorCode=INTERNAL_ERROR）
+```
+
+### 6.2 ステータス確認・結果取得のシーケンス
+
+```
+bash(curl) -> LocalhostOnlyInterceptor.preHandle() -> AsyncTaskExecutionController.getStatus()
+  0. Interceptorによるアクセス制御（6.1と同様、変更なし）
+  1. パス変数 taskId（文字列）を受け取る
+  2. taskId を UUID.fromString(...) でパース
+       - 正しいUUID形式 -> 処理続行
+       - 不正な形式（パース不能） -> IllegalArgumentExceptionが発生 -> AsyncTaskNotFoundExceptionに
+         変換してスロー（404、詳細は7番）
+  3. Controller が AsyncTaskExecutionService.getStatus(taskId) を呼び出す
+  4. Service が状態ストアから find(taskId) を実行
+       - レコードが存在する -> AsyncTaskRecordを返す
+       - レコードが存在しない（未知のtaskId、または既にTTLで削除済み） -> AsyncTaskNotFoundExceptionを
+         スロー（404、詳細は7番）
+  5. Controller が AsyncTaskRecord を AsyncTaskStatusResponse に変換
+       - status が PENDING/RUNNING -> message=null, outputFilePaths=[] で組み立て
+       - status が SUCCEEDED -> message/outputFilePathsを設定
+       - status が FAILED -> messageを設定、outputFilePaths=[]
+  6. HTTP 200 OK としてJSONレスポンスを返却（状態に応じた内容、5.5参照）
+```
+
+### 6.3 トラッキングキーが存在しない・不正な場合の挙動（共通方針）
+
+ステータス確認・結果取得は1本のAPI（`GET /internal/tasks/{taskId}`）に統合されているため、
+以下は当該APIに対して共通で適用される。
+
+| ケース | 検出箇所 | 挙動 |
+| :-- | :-- | :-- |
+| `taskId` がUUID形式として不正（パース不能な文字列） | `AsyncTaskExecutionController.getStatus` 内、`UUID.fromString(...)` 呼び出し時 | `IllegalArgumentException` を捕捉し `AsyncTaskNotFoundException` に変換してスロー → `404 Not Found`（`errorCode=TASK_NOT_FOUND`） |
+| `taskId` がUUID形式として正しいが、状態ストアに存在しない（未発行、または発行直後に削除済み） | `AsyncTaskExecutionService.getStatus` 内、`stateStore.find(taskId)` の結果が空 | `AsyncTaskNotFoundException` をスロー → `404 Not Found`（`errorCode=TASK_NOT_FOUND`） |
+
+- 上記2ケースを同一の例外クラス・同一のエラーコード（`TASK_NOT_FOUND`）・同一のHTTPステータス
+  （404）に統合する。「不正な形式」と「形式は正しいが存在しない」を呼び出し側（bash）が区別する
+  必要性は薄く、いずれも「指定したtaskIdに対応するタスクは見つからない」という共通の結果として
+  扱うのが利用者にとって分かりやすいと判断する。
+- 既存の `TaskExecutionErrorCode.TASK_NOT_FOUND`（既存同期APIの「未知のtaskName」用）とは
+  **異なる例外クラス**（`AsyncTaskNotFoundException`）・**異なるenum**
+  （`AsyncTaskErrorCode.TASK_NOT_FOUND` 等、「8. エラーハンドリング方針」で定義）を用いる。
+  既存の `TaskExecutionErrorCode` を流用すると、本来関係のない既存同期API側の例外ハンドリング
+  ロジック（`TaskExecutionException` を捕捉する既存の `@ExceptionHandler`）と意味的に混同し、
+  既存コードへの変更（enumへの値追加）が必要になってしまうため、新規にenum・例外クラスを追加する
+  方針を採る（既存コード非破壊の原則、「9. 既存コードへの影響範囲」参照）。
+
+## 7. 完了済みタスクの保持期間・削除方針
+
+方式検討で「小さいが実装すべき項目」として残されていたメモリリーク対策を以下の方針で確定する。
+
+**決定: 完了済み（`SUCCEEDED`/`FAILED`）タスクのレコードは、生成から一定時間（TTL）経過後に
+バックグラウンドの定期処理で自動削除する。明示的な削除APIは設けない。**
+
+| 項目 | 内容 |
+| :-- | :-- |
+| TTL（保持期間） | 完了時刻（`updatedAt`）から30分間。`application.properties` の新規キー `async-task.retention-minutes`（既定値30）で設定可能にする（「10. 設定項目」参照）。 |
+| 削除方式 | `@Scheduled(fixedRate = 60000)`（1分間隔）で `AsyncTaskExecutionStateStore.removeIfOlderThan(Instant.now().minus(retention))` を呼び出す専用クラス（`AsyncTaskRetentionScheduler`、`async`パッケージに新規追加）を用意する。`@EnableScheduling` を `AsyncTaskExecutorConfig` に追加する（`@EnableAsync` と同一クラスにまとめて宣言してよい。役割が異なるためBean定義は分けるが、アノテーションの付与先クラスは1つにまとめる）。 |
+| 削除対象の判定 | `status` が `PENDING`/`RUNNING` のレコードは削除しない（実行中のタスクを誤って消さないため）。`SUCCEEDED`/`FAILED` のレコードのみ、`updatedAt` がTTLを超えたものを削除する。 |
+| 削除後の挙動 | 削除後に該当 `taskId` でステータス確認APIを呼ぶと「6.3」の「存在しない」ケースと同じ扱い（`404 Not Found`、`errorCode=TASK_NOT_FOUND`）になる。 |
+| 明示的な削除APIの要否 | 設けない。TTLによる自動削除で十分とし、API表面を増やさない（デモ用途・運用負荷の小ささを優先）。将来的に必要であれば `DELETE /internal/tasks/{taskId}` を追加することは設計上容易（状態ストアに `remove` メソッドを用意済みのため）。 |
+
+**理由**
+
+- 方式検討の制約条件（デモ用途・単一インスタンス・開発者本人による手元操作）の下では、長時間の
+  運用継続（数千〜数万タスクの蓄積）は想定しにくい。TTLベースの自動削除で十分にメモリリークを
+  防止できる。
+- ポーリング間隔の想定（方式検討のbash運用イメージでは2秒間隔）に対し、30分という保持期間は
+  「ポーリングし損ねても十分に再確認できる」余裕を持たせた値である。
+- 削除APIを設けない方針により、API表面・エラーハンドリング（削除権限の有無等）を増やさずに済む。
