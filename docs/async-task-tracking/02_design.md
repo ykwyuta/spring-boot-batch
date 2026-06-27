@@ -63,3 +63,70 @@
 - テストは `@WebMvcTest` + `MockitoBean`（Controller）、プレーンJUnit（Service）、`MockHttpServletRequest`
   相当（Interceptor）、`@RestControllerAdvice` の単体呼び出し（GlobalExceptionHandler）という構成。
   本書はテスト計画工程（`03_test-plan.md`）に向けて分岐を明示する（後述「7. 異常系の分岐」）。
+
+## 2. パッケージ構成・クラス構成
+
+既存の `com.example.demo.task` パッケージ配下に、非同期実行・状態管理のための新規クラスを追加する。
+既存クラス（`TaskExecutionController` 等）は変更しない。
+
+```
+src/main/java/com/example/demo/
+└── task/
+    ├── TaskExecutionController.java                  (既存、変更なし)
+    ├── TaskExecutionService.java                       (既存、変更なし)
+    ├── TaskExecutionResult.java                         (既存、変更なし)
+    ├── async/
+    │   ├── AsyncTaskExecutionController.java           # 新規。非同期実行・ステータス確認・結果取得を公開（Web層）
+    │   ├── AsyncTaskExecutionService.java               # 新規。非同期実行のラッパー（既存TaskExecutionServiceを呼び出す）
+    │   ├── AsyncTaskExecutionStateStore.java            # 新規。ConcurrentHashMapベースの状態ストア（Bean）
+    │   ├── AsyncTaskRecord.java                         # 新規。状態ストアが保持する1タスク分のレコード
+    │   ├── AsyncTaskStatus.java                         # 新規。状態遷移を表すenum
+    │   └── config/
+    │       └── AsyncTaskExecutorConfig.java             # 新規。@EnableAsync + 専用ThreadPoolTaskExecutorのBean定義
+    ├── config/
+    │   └── InternalApiWebConfig.java                   (既存、変更なし)
+    ├── interceptor/
+    │   └── LocalhostOnlyInterceptor.java                (既存、変更なし)
+    ├── dto/
+    │   ├── TaskExecutionRequest.java                    (既存、変更なし)
+    │   ├── TaskExecutionResponse.java                   (既存、変更なし)
+    │   ├── AsyncTaskExecutionRequest.java               # 新規。非同期実行リクエストDTO
+    │   ├── AsyncTaskExecutionAcceptedResponse.java      # 新規。非同期実行受付時レスポンスDTO（taskId即時返却）
+    │   └── AsyncTaskStatusResponse.java                 # 新規。ステータス確認・結果取得共通のレスポンスDTO
+    └── exception/
+        ├── TaskExecutionException.java                  (既存、変更なし)
+        ├── TaskExecutionErrorCode.java                   (既存、変更なし)
+        ├── GlobalExceptionHandler.java                    (既存。新規ExceptionHandlerメソッドのみ追加、既存メソッドは変更なし)
+        ├── ErrorResponse.java                             (既存、変更なし)
+        ├── AsyncTaskNotFoundException.java               # 新規。不正・未知のtaskId指定時の例外
+        └── AsyncTaskNotCompletedException.java           # 新規。未完了タスクへの結果取得時の例外
+```
+
+新規クラスは既存の命名規約（`TaskExecutionXxx`）と区別できるよう `AsyncTaskExecutionXxx`/`AsyncTaskXxx`
+というプレフィックスで統一する（既存同期APIと完全に同名衝突しない範囲で、機能の対応関係が分かる
+命名とする）。`async` という新規サブパッケージを切ることで、既存の `task` パッケージ直下の既存クラスと
+混在せず、責務の境界を明確にする（既存の `config`/`dto`/`exception`/`interceptor` という横断的サブ
+パッケージの構成は流用し、新規クラスをそこに追記する形にする）。
+
+### 2.1 各クラスの責務
+
+| クラス | 責務 |
+| :-- | :-- |
+| `AsyncTaskExecutionController` | 非同期実行・ステータス確認・結果取得の3エンドポイントを公開するWeb層。リクエストのバリデーション結果のハンドリング、`AsyncTaskExecutionService` の呼び出し、レスポンスDTOへの変換のみを担う（業務ロジックは持たない）。既存の `TaskExecutionController` と役割分担の方針を揃える。 |
+| `AsyncTaskExecutionService` | 非同期実行の起点。入力ファイルパスの存在検証、状態ストアへの初期レコード登録（`PENDING`）、`@Async` メソッドの呼び出し（`RUNNING` への遷移と既存 `TaskExecutionService.execute(...)` の実体呼び出し、出力ファイルパスの決定、結果の状態ストアへの反映）を担う。既存の `TaskExecutionService` には依存するが変更は加えない。 |
+| `AsyncTaskExecutionStateStore` | `ConcurrentHashMap<UUID, AsyncTaskRecord>` を保持するシングルトンBean。`save`/`find`/`updateStatus` 等の操作を提供し、状態の読み書きをスレッドセーフに行う。将来DB等の永続化方式に切り替える際の置き換え単位になる（方式検討「将来の拡張性」を踏まえ、Service層から直接 `ConcurrentHashMap` を触らせず本クラスに閉じ込める）。 |
+| `AsyncTaskRecord` | 1タスク分の状態（`taskId`, `status`, `taskName`, `inputFilePaths`, `outputFilePaths`, `message`, `errorCode`, `createdAt`, `updatedAt`）を保持するイミュータブルなレコード（更新時は新しいインスタンスを生成して `ConcurrentHashMap` に再格納する。詳細は「3.3」）。 |
+| `AsyncTaskStatus` | `PENDING`/`RUNNING`/`SUCCEEDED`/`FAILED` の4値を持つenum。状態遷移の定義は「3.2」。 |
+| `AsyncTaskExecutorConfig` | `@EnableAsync` を有効化し、非同期実行専用の `ThreadPoolTaskExecutor`（Bean名 `asyncTaskExecutor`）を定義する設定クラス。スレッドプールサイズ・キュー長は「4. 非同期実行方式」で確定する。 |
+| `AsyncTaskExecutionRequest` | 非同期実行リクエストDTO。`taskName`（既存と同形式）、`parameters`（既存と同形式）、`inputFilePaths: List<String>`（新規）を保持する。 |
+| `AsyncTaskExecutionAcceptedResponse` | 非同期実行受付時（`202 Accepted`）のレスポンスDTO。`taskId`・`status`（`PENDING` 固定）・`acceptedAt` を保持する。 |
+| `AsyncTaskStatusResponse` | ステータス確認・結果取得の両エンドポイントで共用するレスポンスDTO。`taskId`/`status`/`taskName`/`message`/`outputFilePaths`/`createdAt`/`updatedAt` を保持し、未完了時は `outputFilePaths`/`message` が `null`（または空配列）になる（詳細は「5. 公開インターフェース」）。 |
+| `AsyncTaskNotFoundException` | 存在しない・不正な形式の `taskId` が指定された場合にスローする例外。`GlobalExceptionHandler` で `404 Not Found` に変換する。 |
+| `AsyncTaskNotCompletedException` | 完了前（`PENDING`/`RUNNING`）のタスクに対して結果取得APIが呼ばれた場合にスローする例外。`GlobalExceptionHandler` で `409 Conflict` に変換する。 |
+
+Controller / Service / StateStore の3層分離により、以下を実現する。
+
+- `AsyncTaskExecutionService` の `@Async` メソッド呼び出しと状態ストアの読み書きを単体テストしやすい
+  （Spring MVCコンテキストを起動せずに検証できる）。
+- 状態ストアをインタフェース越しではなく具象クラスとして1つに集約することで、将来的な永続化方式への
+  切り替え（方式検討で触れた拡張性）の際に変更箇所を `AsyncTaskExecutionStateStore` に閉じ込められる。
