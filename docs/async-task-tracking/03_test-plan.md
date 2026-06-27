@@ -147,3 +147,40 @@ Service単体テストとして`AsyncTaskExecutionService.getStatus`を直接呼
 注記: GS-06は前述AE-08（同期API・非同期APIの挙動差異）の単体テスト版の一部に相当し、
 `status=FAILED`時にHTTPレベルでは異常を示さない（200 OKのまま）という非同期API特有の挙動を
 Controller/Service結合（`@WebMvcTest`）の粒度で確認する重要なケースである。
+
+## 6. `GlobalExceptionHandler`（新規追加分）のテストケース
+
+セクション1・5.1で各例外発生条件を経由するE2E相当のテスト（`@WebMvcTest`）によってハンドラ
+メソッドも合わせて検証される想定だが、ハンドラ自体のレスポンス組み立てロジック（ステータス・
+ボディ形式の対応）をより直接的に検証するケースを以下に挙げる。既存4メソッド
+（`handleHttpMessageNotReadableException`/`handleValidationException`/
+`handleTaskExecutionException`/`handleUnexpectedException`）は設計書「8.1」「11」の方針通り
+変更されないため、既存テスト（`GlobalExceptionHandlerTest`、`docs/service-bash-invocation/
+03_test-plan.md` EH-01〜EH-05）の対象であり本書では再掲しない。新規追加分の3メソッドのみを
+対象とする。
+
+| ケースID | 対象分岐 | 条件式・分岐先 | 入力条件 | 期待結果 |
+| :-- | :-- | :-- | :-- | :-- |
+| EH-A01 | `handleAsyncTaskNotFoundException` | `AsyncTaskNotFoundException`を捕捉した場合のレスポンス組み立て（GC-02／GS-02と連動） | `AsyncTaskNotFoundException`をハンドラに渡す（またはGC-02/GS-02の条件で`@WebMvcTest`経由） | HTTPステータス`404`。ボディが`status="ERROR"`、`errorCode="TASK_NOT_FOUND"`を含む |
+| EH-A02 | `handleAsyncInputFileNotFoundException` | `AsyncInputFileNotFoundException`を捕捉した場合のレスポンス組み立て（AC-12／AS-04／AS-05と連動） | `AsyncInputFileNotFoundException`をハンドラに渡す（またはAC-12の条件で`@WebMvcTest`経由） | HTTPステータス`404`。ボディが`status="ERROR"`、`errorCode="INPUT_FILE_NOT_FOUND"`を含む |
+| EH-A03 | `handleRejectedExecutionException` | `RejectedExecutionException`を捕捉した場合のレスポンス組み立て（AC-11／AS-07と連動） | `RejectedExecutionException`をハンドラに渡す（またはAC-11の条件で`@WebMvcTest`経由） | HTTPステータス`503`。ボディが`status="ERROR"`、`errorCode="ASYNC_EXECUTOR_BUSY"`を含む |
+| EH-A04 | 既存ハンドラとの優先順位確認（回帰確認） | `@ExceptionHandler`の型ディスパッチにより、既存`Exception.class`汎用ハンドラ（`handleUnexpectedException`）よりも新規3メソッドが優先して呼ばれる | 新規3例外（`AsyncTaskNotFoundException`等）をそれぞれハンドラに渡し、いずれも`handleUnexpectedException`（500・`INTERNAL_ERROR`）には到達しないことを確認する | いずれのケースもEH-A01〜EH-A03の期待結果通りのステータス・`errorCode`になり、`500`/`INTERNAL_ERROR`にはならない |
+
+## 7. `AsyncTaskRetentionScheduler` のテストケース（保持期限スケジューラ、分岐 D1〜D3）
+
+`AsyncTaskExecutionStateStore`を実インスタンスまたはモックとして用い、`removeIfOlderThan`の
+削除対象判定ロジック（境界値を含む）を検証する。`@Scheduled`によるタイマー起動自体（1分間隔）は
+Spring統合テストの範疇であり、C1網羅の対象分岐（D1〜D3）はいずれも`removeIfOlderThan`内の判定
+ロジックに閉じているため、スケジューラクラスからの起動を待たずメソッドを直接呼び出して検証する。
+
+| ケースID | 対象分岐 | 条件式・分岐先 | 入力条件 | 期待結果 |
+| :-- | :-- | :-- | :-- | :-- |
+| RT-01 | D1（削除対象: 完了済み・TTL超過） | `status`が`SUCCEEDED`/`FAILED`かつ`updatedAt`がTTL（しきい値）を超過している場合、レコードを削除する | `updatedAt`をTTLしきい値より過去（例: しきい値の1分前）に設定した`SUCCEEDED`レコードと`FAILED`レコードをそれぞれ`save`し、`removeIfOlderThan(threshold)`を呼び出す | 呼び出し後、両レコードとも`find`で`Optional.empty()`になる（削除されている） |
+| RT-02 | D2（非削除対象: 実行中・TTL超過していても） | `status`が`PENDING`/`RUNNING`の場合、`updatedAt`がTTLを超過していても削除しない | `updatedAt`をTTLしきい値より過去に設定した`PENDING`レコードと`RUNNING`レコードをそれぞれ`save`し、`removeIfOlderThan(threshold)`を呼び出す | 呼び出し後、両レコードとも`find`で値が存在する（削除されていない） |
+| RT-03 | D3（非削除対象: 完了済みだがTTL未満） | `status`が`SUCCEEDED`/`FAILED`だが`updatedAt`がTTL（しきい値）未満（しきい値より新しい）の場合、削除しない | `updatedAt`をTTLしきい値より新しい時刻（例: しきい値の1分後＝現在に近い時刻）に設定した`SUCCEEDED`レコードを`save`し、`removeIfOlderThan(threshold)`を呼び出す | 呼び出し後、当該レコードが`find`で値が存在する（削除されていない） |
+| RT-04（境界値） | D1とD3の境界（`updatedAt == threshold`） | `updatedAt`がしきい値とちょうど等しい場合の境界挙動を確認する（`removeIfOlderThan`の実装が`isBefore`か`!isAfter`かにより削除/非削除が分かれるため、設計書のメソッド名から推定される意図（「しきい値より古い」＝`isBefore(threshold)`）に従い、ちょうど等しい場合は削除されないことを期待値とする） | `updatedAt`をしきい値とまったく同じ`Instant`に設定した`SUCCEEDED`レコードを`save`し、`removeIfOlderThan(threshold)`を呼び出す | 呼び出し後、当該レコードが`find`で値が存在する（削除されない。実装が境界を逆に扱う場合はテスト実装時に実装の意図を確認し、本ケースの期待値を実装に合わせて修正する） |
+
+注記: RT-04は設計書に明記された分岐（D1〜D3）には直接対応しないが、「削除対象/非対象の境界」を
+明示的に検証するようテスト計画作成依頼で指示されているため、D1・D3の橋渡しとなる境界値ケースを
+追加した。実装フェーズで`removeIfOlderThan`の比較演算子（`isBefore`/`isAfter`/`equals`の扱い）が
+確定した時点で、本ケースの期待値が設計意図と一致するか改めて確認する。
