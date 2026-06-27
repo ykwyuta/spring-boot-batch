@@ -99,3 +99,51 @@
 番号を予約する形にする（対象分岐B3・設計書8.3節の両方に対応付ける）。AE-01は厳密な競合条件の検証が
 難しいため、実装フェーズでは`TaskExecutionService`をモック化し`execute`呼び出し時にコールバックで
 状態ストアの値を確認する手法、または`Mockito`の`doAnswer`で検証する手法を用いることを想定する。
+
+## 4. `AsyncTaskExecutionStateStore` のテストケース（基盤クラスの読み書き）
+
+`AsyncTaskExecutionStateStore`を直接インスタンス化し、`save`/`find`/`update`/`remove`の基本動作を
+検証する。本クラス自体はC1分岐表（A〜D）に直接列挙されていないが、セクション2・3・5・6のテストが
+依拠する基盤であり、`update`のアトミック性・`find`の`Optional`戻り値の扱いを単体で確認しておく。
+
+| ケースID | 対象分岐 | 条件式・分岐先 | 入力条件 | 期待結果 |
+| :-- | :-- | :-- | :-- | :-- |
+| SS-01 | `find`（存在する場合） | `save`済みの`taskId`を`find`した場合、`Optional`に値が入って返る | `AsyncTaskRecord.pending(...)`を`save`した直後に同じ`taskId`で`find`する | `Optional.isPresent()`が`true`。内容が`save`したレコードと一致する |
+| SS-02 | `find`（存在しない場合） | `save`していない`taskId`を`find`した場合、空の`Optional`が返る | ランダムな`UUID`で`find`する | `Optional.isEmpty()`が`true` |
+| SS-03 | `update`（既存レコードへの遷移適用） | 既存レコードに`UnaryOperator`を適用し、更新後の値を保存して返す | `PENDING`レコードを`save`後、`update(taskId, record -> record.withRunning(Instant.now()))`を呼び出す | 戻り値の`status`が`RUNNING`。`find`で取得した値も同様に`RUNNING`に更新されている |
+| SS-04 | `remove` | 登録済みレコードを削除すると、以後の`find`が空になる | レコードを`save`後、`remove(taskId)`を呼び出し、その後`find(taskId)`する | `find`の戻り値が`Optional.empty()` |
+
+## 5. ステータス確認・結果取得API（`GET /internal/tasks/{taskId}`）のテストケース（分岐 C1〜C8）
+
+`AsyncTaskExecutionController`のController層テスト（C1/C2はUUIDパース失敗時の挙動、C3/C4は
+Service呼び出し結果の分岐）と、`AsyncTaskExecutionService.getStatus`のService層テスト（状態ストア
+検索とレスポンス組み立てに対応するC3〜C8）に分けて検証する。`C0a`/`C0b`はセクション1と同様の理由
+（既存`LocalhostOnlyInterceptor`の再利用）でセクション7の結合シナリオでのみ疎通確認する。
+
+### 5.1 `AsyncTaskExecutionController.getStatus` のテストケース（Controller層、分岐 C1, C2）
+
+`@WebMvcTest(AsyncTaskExecutionController.class)`を用い、`AsyncTaskExecutionService`をモック化する。
+
+| ケースID | 対象分岐 | 条件式・分岐先 | 入力条件 | 期待結果 |
+| :-- | :-- | :-- | :-- | :-- |
+| GC-01 | C1（正しいUUID形式） | `taskId`パス変数が正しいUUID形式の場合、パース成功し状態ストア検索（Service呼び出し）に進む | `GET /internal/tasks/{正しいUUID文字列}`を送信。モックの`getStatus`が`PENDING`の`AsyncTaskRecord`を返すよう設定 | HTTPステータス `200 OK`。`AsyncTaskExecutionService.getStatus`がパース済み`UUID`で呼び出される |
+| GC-02 | C2（不正な形式） | `taskId`パス変数がUUID形式としてパース不能な場合、`AsyncTaskNotFoundException`に変換してスローする | `GET /internal/tasks/not-a-valid-uuid`を送信 | HTTPステータス `404 Not Found`。`errorCode="TASK_NOT_FOUND"`。`AsyncTaskExecutionService.getStatus`は呼び出されない |
+
+### 5.2 `AsyncTaskExecutionService.getStatus` ＋ レスポンス組み立てのテストケース（分岐 C3〜C8）
+
+Service単体テストとして`AsyncTaskExecutionService.getStatus`を直接呼び出すケース（C3/C4）と、
+`@WebMvcTest`を用いてレスポンスボディの内容まで確認するケース（C5〜C8、Controllerのレスポンス
+組み立てロジックを含めて検証）に分ける。
+
+| ケースID | 対象分岐 | 条件式・分岐先 | 入力条件 | 期待結果 |
+| :-- | :-- | :-- | :-- | :-- |
+| GS-01 | C3（レコードが存在する） | 状態ストアに該当`taskId`のレコードが存在する場合、`AsyncTaskRecord`を返す | `save`済みの`taskId`で`getStatus(taskId)`を呼び出す | 例外をスローせず、`save`したレコードと一致する`AsyncTaskRecord`を返す |
+| GS-02 | C4（レコードが存在しない） | 状態ストアに該当`taskId`のレコードが存在しない場合（未発行、またはTTLで削除済み）、`AsyncTaskNotFoundException`をスローする | 未登録のランダムな`UUID`で`getStatus(taskId)`を呼び出す | `AsyncTaskNotFoundException`がスローされる |
+| GS-03 | C5（status=PENDING） | レスポンス組み立てにおいて`status=PENDING`の場合、`message=null`、`outputFilePaths=[]`で組み立てる | `PENDING`状態の`AsyncTaskRecord`を返すモックを設定し、`GET /internal/tasks/{taskId}`を実行（`@WebMvcTest`経由） | HTTPステータス`200 OK`。レスポンスボディの`status="PENDING"`、`message`が`null`、`outputFilePaths`が空配列 |
+| GS-04 | C6（status=RUNNING） | `status=RUNNING`の場合も同様に`message=null`、`outputFilePaths=[]`で組み立てる | `RUNNING`状態の`AsyncTaskRecord`を返すモックを設定し、`GET /internal/tasks/{taskId}`を実行 | HTTPステータス`200 OK`。レスポンスボディの`status="RUNNING"`、`message`が`null`、`outputFilePaths`が空配列 |
+| GS-05 | C7（status=SUCCEEDED） | `status=SUCCEEDED`の場合、`message`/`outputFilePaths`を設定して組み立てる | `SUCCEEDED`状態（`message="task executed successfully"`、`outputFilePaths=["/tmp/async-tasks/{taskId}/result.txt"]`）の`AsyncTaskRecord`を返すモックを設定し、`GET /internal/tasks/{taskId}`を実行 | HTTPステータス`200 OK`。レスポンスボディの`status="SUCCEEDED"`、`message`と`outputFilePaths`がモックの値と一致 |
+| GS-06 | C8（status=FAILED） | `status=FAILED`の場合、`message`を設定、`outputFilePaths=[]`で組み立てる | `FAILED`状態（`message="precondition not satisfied for task: task-business-failure"`、`errorCode="TASK_EXECUTION_FAILED"`）の`AsyncTaskRecord`を返すモックを設定し、`GET /internal/tasks/{taskId}`を実行 | HTTPステータス`200 OK`（**422や4xx系にはならないことを明示的に確認**、設計書「8.3」差異）。レスポンスボディの`status="FAILED"`、`message`がモックの値と一致、`outputFilePaths`が空配列。レスポンスボディに`errorCode`フィールド自体が存在しないこと（設計書「5.5」方針）も確認する |
+
+注記: GS-06は前述AE-08（同期API・非同期APIの挙動差異）の単体テスト版の一部に相当し、
+`status=FAILED`時にHTTPレベルでは異常を示さない（200 OKのまま）という非同期API特有の挙動を
+Controller/Service結合（`@WebMvcTest`）の粒度で確認する重要なケースである。
