@@ -256,3 +256,108 @@ public record AsyncTaskRecord(
 - `update` メソッドは `ConcurrentHashMap#compute(taskId, (key, old) -> updater.apply(old))` を用いて
   実装し、読み取りと書き込みの間に他スレッドの介入を許さない（同一 `taskId` への同時更新が将来
   発生する設計変更があっても安全側に倒す）。
+
+## 4. 非同期実行方式の確定
+
+### 4.1 採用方式: `@Async` + `@EnableAsync` + 専用 `ThreadPoolTaskExecutor`
+
+方式検討では「`@Async`」と「明示的な `ExecutorService`」のどちらでも実現可能とされていたが、本設計では
+**`@Async` + 専用 `ThreadPoolTaskExecutor`** を採用する。
+
+**採用理由**
+
+1. Spring宣言的な書き方であり、`AsyncTaskExecutionService` のメソッドに `@Async` を付与するだけで
+   スレッドプールへのディスパッチが行われる。明示的な `ExecutorService.submit(...)` 呼び出しを
+   Service内に書く必要がなく、業務ロジック（既存 `TaskExecutionService.execute(...)` の呼び出しと
+   状態更新）に専念できる。
+2. 専用の `ThreadPoolTaskExecutor` をBean定義することで、スレッドプールサイズ・キュー長・拒否時の
+   挙動（`RejectedExecutionHandler`）を一箇所（`AsyncTaskExecutorConfig`）に集約できる。
+   `Executors.newFixedThreadPool(...)` を直接使う場合と比べ、Spring Bootの標準的な設定パターン
+   （`ThreadPoolTaskExecutor` の `setCorePoolSize`/`setMaxPoolSize`/`setQueueCapacity`）に従える。
+3. 例外伝播の扱いが明確になる。`@Async` メソッドの戻り値を `void` にする場合、メソッド内で発生した
+   例外はSpring既定では握りつぶされてログ出力のみとなる（`AsyncUncaughtExceptionHandler`）。
+   本設計では「メソッド内で必ず `try-catch` し、状態ストアへの `FAILED` 反映を行ってから握る」方式を
+   採用する（詳細は「4.4」）ため、戻り値型は `void` で問題ない（`CompletableFuture` を使い呼び出し元で
+   `.exceptionally(...)` を扱う必要がない）。
+
+### 4.2 `AsyncTaskExecutorConfig`
+
+```java
+@Configuration
+@EnableAsync
+public class AsyncTaskExecutorConfig {
+
+    @Bean(name = "asyncTaskExecutor")
+    public Executor asyncTaskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(2);
+        executor.setMaxPoolSize(4);
+        executor.setQueueCapacity(50);
+        executor.setThreadNamePrefix("async-task-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
+        executor.initialize();
+        return executor;
+    }
+}
+```
+
+| 設定項目 | 値 | 理由 |
+| :-- | :-- | :-- |
+| `corePoolSize` | 2 | デモ用途・単一インスタンス・開発者本人による手元操作という前提（方式検討の制約条件1・2）の下では、同時に多数のタスクが実行されることは想定しない。2並列を確保しつつスレッド数を絞る。 |
+| `maxPoolSize` | 4 | 一時的な同時実行数の上振れに対応するための上限。コア数を超える分はキュー投入後にあふれた場合のみ追加生成される（`ThreadPoolTaskExecutor` の既定動作）。 |
+| `queueCapacity` | 50 | 同時に50件までは即座に受理しキューイングできるようにする。デモ用途として十分な余裕を持たせる値とした。 |
+| `RejectedExecutionHandler` | `AbortPolicy`（既定） | キュー（50件）も使い切った場合は `RejectedExecutionException` を呼び出し元（Controllerを呼び出したスレッド）にスローさせ、明示的にエラーレスポンスへ変換する（「4.3」参照。タスクを静かに捨てる `DiscardPolicy` 等は状態不整合（`PENDING` のまま実行されないタスクが残る）を招くため不採用）。 |
+| `threadNamePrefix` | `async-task-` | ログ・スレッドダンプ上で非同期タスク用スレッドを識別しやすくする。 |
+
+`@Async("asyncTaskExecutor")` のように明示的にExecutor名を指定して `AsyncTaskExecutionService` の
+メソッドへ付与する（Bean名を明示することで、将来 `@EnableAsync` 対象が増えた場合にデフォルト
+Executorとの混同を避ける）。
+
+### 4.3 スレッドプール飽和時（`RejectedExecutionException`）の扱い
+
+- `@Async` メソッドの呼び出し自体（≒ `Executor.execute(...)` の呼び出し）はリクエストを受けた
+  Servletスレッド上で行われる。`ThreadPoolTaskExecutor` がコアプール・最大プール・キューのすべてを
+  使い切っている状態でリクエストが来た場合、`AbortPolicy` により `RejectedExecutionException`
+  （`java.util.concurrent` の非チェック例外）がそのまま `AsyncTaskExecutionService` の非同期実行
+  起動メソッドの呼び出し元（＝`AsyncTaskExecutionController`）に伝播する。
+- この例外は `GlobalExceptionHandler` の汎用 `handleUnexpectedException`（`Exception.class` ハンドラ）
+  で捕捉され、`503 Service Unavailable` を返す専用ハンドラを追加する（「8. エラーハンドリング方針」
+  参照。500ではなく503とするのは、サーバーの実装不備ではなく一時的な過負荷であることをHTTPセマンティクス
+  上明確にするため）。
+- このケースでは状態ストアへの登録（`PENDING`）は行わない（リクエスト自体を受理しなかったものとして
+  扱う）。状態ストアに不整合なレコードを残さないよう、`AsyncTaskExecutionService` は
+  「状態ストアへの `PENDING` 登録」を「`@Async` メソッドの呼び出し（ディスパッチ）」の**前**に行うか
+  **後**に行うかを設計上明確にする必要がある。本設計では、**ディスパッチ呼び出しが
+  `RejectedExecutionException` をスローした場合に登録済みレコードを残さないよう、状態ストアへの登録は
+  `@Async` メソッド呼び出しの直前に行い、呼び出し自体が例外をスローした場合は登録したレコードを
+  削除してから例外を再スローする**方式を採る（実装詳細は「6.2 処理フロー」参照）。
+
+### 4.4 `@Async` メソッド内での例外処理方針
+
+```java
+@Async("asyncTaskExecutor")
+public void executeAsync(UUID taskId, String taskName, Map<String, String> parameters,
+                          List<String> inputFilePaths) {
+    stateStore.update(taskId, record -> record.withRunning(Instant.now()));
+    try {
+        TaskExecutionResult result = taskExecutionService.execute(taskName, parameters);
+        List<String> outputFilePaths = resolveOutputFilePaths(taskId, taskName);
+        stateStore.update(taskId, record ->
+                record.withSucceeded(outputFilePaths, result.message(), Instant.now()));
+    } catch (TaskExecutionException ex) {
+        stateStore.update(taskId, record ->
+                record.withFailed(ex.getErrorCode().name(), ex.getMessage(), Instant.now()));
+    } catch (Exception ex) {
+        logger.error("unexpected error occurred while executing async task {}", taskId, ex);
+        stateStore.update(taskId, record ->
+                record.withFailed("INTERNAL_ERROR", "unexpected error occurred", Instant.now()));
+    }
+}
+```
+
+- `@Async` メソッド内で発生するすべての例外（`TaskExecutionException` か想定外の例外か）を
+  必ず `catch` し、状態ストアを `FAILED` に更新してから握る（呼び出し元には何も伝播させない）。
+  これにより、Spring既定の `AsyncUncaughtExceptionHandler`（ログ出力のみで状態を残さない）に
+  処理を委ねず、必ず状態ストアの整合性を保つ。
+- 想定外の例外（`Exception` 全般）はサーバーログに `logger.error(...)` で記録する（既存の
+  `GlobalExceptionHandler.handleUnexpectedException` と同様の方針をここでも踏襲する）。
