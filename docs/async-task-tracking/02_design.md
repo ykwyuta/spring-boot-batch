@@ -112,9 +112,9 @@ src/main/java/com/example/demo/
 
 | クラス | 責務 |
 | :-- | :-- |
-| `AsyncTaskExecutionController` | 非同期実行・ステータス確認・結果取得の3エンドポイントを公開するWeb層。リクエストのバリデーション結果のハンドリング、`AsyncTaskExecutionService` の呼び出し、レスポンスDTOへの変換のみを担う（業務ロジックは持たない）。既存の `TaskExecutionController` と役割分担の方針を揃える。 |
+| `AsyncTaskExecutionController` | 非同期実行受付・状態/結果取得の2エンドポイント（「5.1」で統合を決定）を公開するWeb層。リクエストのバリデーション結果のハンドリング、`AsyncTaskExecutionService` の呼び出し、レスポンスDTOへの変換のみを担う（業務ロジックは持たない）。既存の `TaskExecutionController` と役割分担の方針を揃える。 |
 | `AsyncTaskExecutionService` | 非同期実行の起点。入力ファイルパスの存在検証、状態ストアへの初期レコード登録（`PENDING`）、`@Async` メソッドの呼び出し（`RUNNING` への遷移と既存 `TaskExecutionService.execute(...)` の実体呼び出し、出力ファイルパスの決定、結果の状態ストアへの反映）を担う。既存の `TaskExecutionService` には依存するが変更は加えない。 |
-| `AsyncTaskExecutionStateStore` | `ConcurrentHashMap<UUID, AsyncTaskRecord>` を保持するシングルトンBean。`save`/`find`/`updateStatus` 等の操作を提供し、状態の読み書きをスレッドセーフに行う。将来DB等の永続化方式に切り替える際の置き換え単位になる（方式検討「将来の拡張性」を踏まえ、Service層から直接 `ConcurrentHashMap` を触らせず本クラスに閉じ込める）。 |
+| `AsyncTaskExecutionStateStore` | `ConcurrentHashMap<UUID, AsyncTaskRecord>` を保持するシングルトンBean。`save`/`find`/`update`/`remove` 等の操作を提供し、状態の読み書きをスレッドセーフに行う。将来DB等の永続化方式に切り替える際の置き換え単位になる（方式検討「将来の拡張性」を踏まえ、Service層から直接 `ConcurrentHashMap` を触らせず本クラスに閉じ込める）。 |
 | `AsyncTaskRecord` | 1タスク分の状態（`taskId`, `status`, `taskName`, `inputFilePaths`, `outputFilePaths`, `message`, `errorCode`, `createdAt`, `updatedAt`）を保持するイミュータブルなレコード（更新時は新しいインスタンスを生成して `ConcurrentHashMap` に再格納する。詳細は「3.3」）。 |
 | `AsyncTaskStatus` | `PENDING`/`RUNNING`/`SUCCEEDED`/`FAILED` の4値を持つenum。状態遷移の定義は「3.2」。 |
 | `AsyncTaskExecutorConfig` | `@EnableAsync` を有効化し、非同期実行専用の `ThreadPoolTaskExecutor`（Bean名 `asyncTaskExecutor`）を定義する設定クラス。スレッドプールサイズ・キュー長は「4. 非同期実行方式」で確定する。 |
