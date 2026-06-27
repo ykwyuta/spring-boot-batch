@@ -130,3 +130,129 @@ Controller / Service / StateStore の3層分離により、以下を実現する
   （Spring MVCコンテキストを起動せずに検証できる）。
 - 状態ストアをインタフェース越しではなく具象クラスとして1つに集約することで、将来的な永続化方式への
   切り替え（方式検討で触れた拡張性）の際に変更箇所を `AsyncTaskExecutionStateStore` に閉じ込められる。
+
+## 3. 状態ストアの設計
+
+### 3.1 `AsyncTaskExecutionStateStore`
+
+```java
+@Component
+public class AsyncTaskExecutionStateStore {
+
+    private final ConcurrentHashMap<UUID, AsyncTaskRecord> records = new ConcurrentHashMap<>();
+
+    public void save(AsyncTaskRecord record) { ... }
+
+    public Optional<AsyncTaskRecord> find(UUID taskId) { ... }
+
+    /**
+     * 既存レコードに対して更新関数を適用し、結果を保存する。
+     * 楽観的な単一スレッド更新（同一taskIdに対する更新は実行スレッド1つのみが行うため、
+     * 厳密なCAS（compareAndSet）は必須ではないが、ConcurrentHashMap#computeを用いて
+     * スレッドセーフ性を保証する。詳細は「3.4」参照。
+     */
+    public AsyncTaskRecord update(UUID taskId, UnaryOperator<AsyncTaskRecord> updater) { ... }
+
+    public void removeIfOlderThan(Instant threshold) { ... } // 「6. 完了済みタスクの保持期間」で使用
+}
+```
+
+- シングルトンBean（`@Component`）として1インスタンスのみ生成され、`AsyncTaskExecutionService` に
+  コンストラクタインジェクションされる。
+- キーは `UUID`（`TaskId` 型のラッパークラスは導入せず、`java.util.UUID` をそのまま使う。方式検討
+  「トラッキングキーの生成方式」の結論を踏襲し、追加の抽象化は導入しないシンプルな方針とする）。
+- `find` の戻り値を `Optional<AsyncTaskRecord>` とすることで、呼び出し側（Service層）に
+  「taskIdが存在しない」分岐の処理を強制し、`null` チェック漏れを防ぐ。
+
+### 3.2 `AsyncTaskStatus`（状態遷移）
+
+```java
+public enum AsyncTaskStatus {
+    /** 受付済み、実行スレッドへのディスパッチ待ち。 */
+    PENDING,
+    /** 非同期実行スレッドで処理中。 */
+    RUNNING,
+    /** 処理が正常終了。 */
+    SUCCEEDED,
+    /** 処理が異常終了（業務的な失敗、または想定外の例外）。 */
+    FAILED
+}
+```
+
+**状態遷移図**
+
+```
+            (1) 非同期実行リクエスト受理・状態ストアへ初期登録
+                          │
+                          ▼
+                      PENDING
+                          │
+        (2) スレッドプールがタスクをディスパッチし実行開始
+                          │
+                          ▼
+                      RUNNING
+                ┌─────────┴─────────┐
+   (3a) 正常終了 │                   │ (3b) 異常終了
+                ▼                   ▼
+            SUCCEEDED             FAILED
+        （終端状態。以後遷移しない）（終端状態。以後遷移しない）
+```
+
+| # | 遷移元 | 遷移先 | 遷移条件 |
+| :-- | :-- | :-- | :-- |
+| T1 | （新規） | `PENDING` | `AsyncTaskExecutionService` が非同期実行リクエストを受理し、入力ファイル存在検証を通過した直後に状態ストアへ初期登録する。 |
+| T2 | `PENDING` | `RUNNING` | `@Async` メソッドが実際にスレッドプール上で実行を開始した直後（既存 `TaskExecutionService.execute(...)` 呼び出し前）。 |
+| T3 | `RUNNING` | `SUCCEEDED` | `TaskExecutionService.execute(...)` が `TaskExecutionResult` を正常に返した場合。出力ファイルパスの決定（「5.4」参照）も合わせて完了させてから遷移する。 |
+| T4 | `RUNNING` | `FAILED` | `TaskExecutionService.execute(...)` が `TaskExecutionException` をスローした場合、または想定外の例外（`RuntimeException` 等）をスローした場合。 |
+
+- `SUCCEEDED`/`FAILED` は終端状態であり、以後の遷移は発生しない（再実行する場合は新規の非同期実行
+  リクエスト＝新しい `taskId` で行う。同一 `taskId` への再実行APIは設けない）。
+- `PENDING` から直接 `FAILED`/`SUCCEEDED` への遷移は発生しない設計とする（スレッドプールへの
+  ディスパッチ自体が失敗するケース、すなわちキューが満杯で `RejectedExecutionException` が発生する
+  ケースをどう扱うかは「4.3」「7. 異常系の分岐」で個別に扱う）。
+
+### 3.3 `AsyncTaskRecord`
+
+```java
+public record AsyncTaskRecord(
+        UUID taskId,
+        AsyncTaskStatus status,
+        String taskName,
+        List<String> inputFilePaths,
+        List<String> outputFilePaths,
+        String message,
+        String errorCode,
+        Instant createdAt,
+        Instant updatedAt) {
+
+    static AsyncTaskRecord pending(UUID taskId, String taskName, List<String> inputFilePaths, Instant now) {
+        return new AsyncTaskRecord(taskId, AsyncTaskStatus.PENDING, taskName, inputFilePaths,
+                List.of(), null, null, now, now);
+    }
+
+    AsyncTaskRecord withRunning(Instant now) { ... }          // RUNNINGへの遷移（T2）
+    AsyncTaskRecord withSucceeded(List<String> outputFilePaths, String message, Instant now) { ... } // T3
+    AsyncTaskRecord withFailed(String errorCode, String message, Instant now) { ... }                // T4
+}
+```
+
+- イミュータブルな `record` として実装し、状態遷移のたびに新しいインスタンスを生成して
+  `AsyncTaskExecutionStateStore#update` 経由で `ConcurrentHashMap` に再格納する（更新中の一時的な
+  不整合状態を読み取られるリスクを避ける。`ConcurrentHashMap` は同一キーに対する値の置き換え自体は
+  アトミックである）。
+- `outputFilePaths` は `PENDING`/`RUNNING` 中は空リスト（`List.of()`）、`SUCCEEDED` 時に確定値が
+  設定される。`message`/`errorCode` も同様に未完了中は `null`。
+
+### 3.4 並行性に関する設計判断
+
+- 1つの `taskId` に対して状態を更新するスレッドは、非同期実行を担う1スレッドのみである
+  （`AsyncTaskExecutionService` の `@Async` メソッド内で `PENDING -> RUNNING -> SUCCEEDED/FAILED` の
+  遷移を直列に行うため、同一 `taskId` に対する更新の競合は発生しない）。
+- 一方、「更新中の `taskId` を別スレッド（HTTPリクエストを処理するスレッド）がポーリングで読み取る」
+  という競合は常に発生し得るため、`AsyncTaskExecutionStateStore#find` は `ConcurrentHashMap#get` を
+  そのまま使い、読み取り側で最新の状態（更新がまだ反映されていなければ更新前の状態）を一貫した
+  スナップショットとして取得できることを保証する（`AsyncTaskRecord` がイミュータブルであるため、
+  読み取った瞬間の値が部分的に矛盾することはない）。
+- `update` メソッドは `ConcurrentHashMap#compute(taskId, (key, old) -> updater.apply(old))` を用いて
+  実装し、読み取りと書き込みの間に他スレッドの介入を許さない（同一 `taskId` への同時更新が将来
+  発生する設計変更があっても安全側に倒す）。
