@@ -35,3 +35,31 @@
     既存システムへの副作用まで含めて妥当であることを示せれば、再レビューで承認可能と判断する。
   - 422のレスポンス組み立て方法、例外とerrorCodeの対応方針について一言補足があると、
     実装フェーズでの解釈のブレを防げる（必須ではないが推奨）。
+
+---
+
+日時: 2026-06-27 12:30:00
+対象ドキュメント: docs/service-bash-invocation/02_design.md（修正版、コミット cc5b902）
+レビュー観点: 前回指摘（アクセス制御方式の変更、422レスポンス組み立て方針、errorCode振り分け方針）への対応状況の再確認
+指摘事項（前回指摘への対応状況）:
+  - 【重要指摘・対応済み】`server.address=127.0.0.1` によるアプリ全体のバインドアドレス制限を撤回し、
+    `/internal/**` パスのみを対象とする `HandlerInterceptor`（`LocalhostOnlyInterceptor`）＋
+    `WebMvcConfigurer`（`InternalApiWebConfig`）による方式に変更されている（「0.1」「2」「5.1」「9」）。
+    `addPathPatterns("/internal/**")` で適用範囲が明示され、既存・将来のThymeleafベースの
+    業務用画面・APIには影響を与えないことが「9. 既存コードへの影響範囲」で明記されている。
+    対応方針(b)が採用され、前回指摘は解消している。
+  - 【軽微指摘・対応済み】422レスポンスの組み立て方針が「6.2」に明記された。
+    `TaskExecutionException` に `@ResponseStatus` を付与せず、`GlobalExceptionHandler` 側で
+    `errorCode` に応じて `ResponseEntity.status(...)` を明示的に組み立てる方式とし、理由
+    （1つの例外クラスが複数のHTTPステータスに対応するため固定の `@ResponseStatus` では表現不可）
+    も記載されている。
+  - 【軽微指摘・対応済み】`TaskExecutionException` の `errorCode` 振り分け方針が「6.3」に明記された。
+    enum (`TaskExecutionErrorCode`) をフィールドとして保持する方式を採用し、`TASK_NOT_FOUND` /
+    `TASK_EXECUTION_FAILED` の発生条件、および想定外の実行時例外は本例外でラップせずそのまま
+    伝播させる方針が明記されている。
+  - その他、リバースプロキシ経由アクセス（`X-Forwarded-For`）が考慮されていない点はスコープ外として
+    明示的に記載されており（「5.1」「5.4」）、現状のデモ用途・前提条件と矛盾しないため許容する。
+  - 4.2の異常系分岐表（#0a, #0b含む）はInterceptor/Service/Controllerそれぞれの単体テストでの
+    検証方針も付記されており、後続のテスト計画工程でC1観点の分岐を洗い出すのに十分な粒度である。
+対応: 前回指摘（重要1件、軽微2件）はいずれも反映済みと確認。追加の指摘事項なし。
+結論: 承認
