@@ -1,0 +1,11 @@
+日時: 2026-06-27 12:13:30
+指摘内容: 全作業に適用するルールをCLAUDE.mdに、必要な時だけ参照するルールを.claude/rules/以下に分割して記載する。スキル/エージェント作成ルールは公式ドキュメント(skills, sub-agents)を確認して.claude/rules/に要点をまとめる。ドキュメントはタイムアウト防止のため段階的に書き出しコミットする。スキル/エージェントの作成・改修履歴は.claude/logs/skills-日時.logに、ユーザー指摘に基づく作業内容はlogs/claude-日時.logに記録する。廃止したスキル/エージェントは削除せず.claude/deprecated/に移動する。
+実施内容:
+- CLAUDE.mdを新規作成し、常時適用ルールと.claude/rules/以下のルール一覧を記載
+- .claude/rules/skills-creation.md にスキル作成ルール（配置場所、ファイル構成、frontmatter）を記載
+- .claude/rules/subagents-creation.md にサブエージェント作成ルール（配置場所、frontmatter、命名規則）を記載
+- .claude/rules/logging.md にログ記録ルール（スキル/エージェント変更履歴、作業履歴）を記載
+- .claude/rules/deprecation.md に廃止手順ルールを記載
+- .claude/deprecated/skills, .claude/deprecated/agents の雛形ディレクトリを作成
+- 各ファイルは個別にコミットし、段階的にコミットする方針を実践
+変更ファイル: CLAUDE.md, .claude/rules/skills-creation.md, .claude/rules/subagents-creation.md, .claude/rules/logging.md, .claude/rules/deprecation.md, .claude/deprecated/.gitkeep, logs/claude-20260627-121330.log
