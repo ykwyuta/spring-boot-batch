@@ -10,6 +10,7 @@ import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
 import java.time.Instant;
+import java.util.concurrent.RejectedExecutionException;
 
 /**
  * {@code /internal/**} 配下で発生する例外を統一的なエラーレスポンスに変換する。
@@ -53,5 +54,25 @@ public class GlobalExceptionHandler {
         logger.error("unexpected error occurred while executing task", ex);
         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                 .body(new ErrorResponse("ERROR", "INTERNAL_ERROR", "unexpected error occurred", Instant.now()));
+    }
+
+    @ExceptionHandler(AsyncTaskNotFoundException.class)
+    public ResponseEntity<ErrorResponse> handleAsyncTaskNotFoundException(AsyncTaskNotFoundException ex) {
+        return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                .body(new ErrorResponse("ERROR", "TASK_NOT_FOUND", ex.getMessage(), Instant.now()));
+    }
+
+    @ExceptionHandler(AsyncInputFileNotFoundException.class)
+    public ResponseEntity<ErrorResponse> handleAsyncInputFileNotFoundException(AsyncInputFileNotFoundException ex) {
+        return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                .body(new ErrorResponse("ERROR", "INPUT_FILE_NOT_FOUND", ex.getMessage(), Instant.now()));
+    }
+
+    @ExceptionHandler(RejectedExecutionException.class)
+    public ResponseEntity<ErrorResponse> handleRejectedExecutionException(RejectedExecutionException ex) {
+        logger.error("async task thread pool saturated", ex);
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                .body(new ErrorResponse(
+                        "ERROR", "ASYNC_EXECUTOR_BUSY", "server is busy, please retry later", Instant.now()));
     }
 }
