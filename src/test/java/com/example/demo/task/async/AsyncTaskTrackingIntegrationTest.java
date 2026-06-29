@@ -8,7 +8,8 @@ import com.example.demo.task.dto.TaskExecutionRequest;
 import com.example.demo.task.exception.ErrorResponse;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.boot.resttestclient.TestRestTemplate;
+import org.springframework.boot.resttestclient.autoconfigure.AutoConfigureTestRestTemplate;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
@@ -34,6 +35,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * 自然に通過する）経由でHTTPリクエストを送る（テスト計画セクション8の方針）。</p>
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@AutoConfigureTestRestTemplate
 class AsyncTaskTrackingIntegrationTest {
 
     private static final Duration POLL_TIMEOUT = Duration.ofSeconds(5);
@@ -65,7 +67,7 @@ class AsyncTaskTrackingIntegrationTest {
                 jsonEntity(new TaskExecutionRequest(TaskExecutionService.TASK_NAME_BUSINESS_FAILURE, Map.of()));
         ResponseEntity<ErrorResponse> syncResponse =
                 restTemplate.postForEntity("/internal/tasks/execute", syncRequest, ErrorResponse.class);
-        assertThat(syncResponse.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+        assertThat(syncResponse.getStatusCode().value()).isEqualTo(422);
         assertThat(syncResponse.getBody()).isNotNull();
         assertThat(syncResponse.getBody().errorCode()).isEqualTo("TASK_EXECUTION_FAILED");
 

@@ -15,6 +15,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -37,8 +38,9 @@ public class AsyncTaskExecutionController {
     @PostMapping("/internal/tasks/execute-async")
     public ResponseEntity<AsyncTaskExecutionAcceptedResponse> executeAsync(
             @Valid @RequestBody AsyncTaskExecutionRequest request) {
+        Map<String, String> parameters = request.parameters() != null ? request.parameters() : Map.of();
         UUID taskId = asyncTaskExecutionService.acceptAsyncExecution(
-                request.taskName(), request.parameters(), request.inputFilePaths());
+                request.taskName(), parameters, request.inputFilePaths());
 
         AsyncTaskExecutionAcceptedResponse response = new AsyncTaskExecutionAcceptedResponse(
                 taskId, AsyncTaskStatus.PENDING.name(), Instant.now());
