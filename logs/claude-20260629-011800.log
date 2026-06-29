@@ -1,0 +1,54 @@
+日時: 2026-06-29 01:18:00
+指摘内容: 「java 21で実施して」。直前の完了報告で、本サンドボックス環境にJava 25ツールチェイン・
+テスト依存JARが存在せず./gradlew compileJava/testが実行不可だったため目視照合のみで正確性を
+担保したと報告していたが、実際にインストールされているJava 21で./gradlew testを実行して
+検証することを依頼された。
+
+実施内容:
+  1. build.gradleのtoolchainをJavaLanguageVersion.of(25)→of(21)に変更。
+     gradlewに実行権限を付与（chmod +x）。
+  2. ./gradlew test --no-daemon を実行し、以下の不具合を発見・修正した。
+     a. AsyncTaskTrackingIntegrationTest: TestRestTemplateのimportが
+        Spring Boot 4.x（org.springframework.boot.test.web.client）の旧パスを
+        指しており、コンパイル不可（package does not exist）。
+        実際の新パス org.springframework.boot.resttestclient.TestRestTemplate
+        （spring-boot-resttestclient-4.0.7.jar、TestRestTemplate.classを
+        jar内検索して特定）に修正。
+     b. 上記修正後、4件の結合テストがNoSuchBeanDefinitionException/
+        NoClassDefFoundErrorで失敗。Spring Boot 4.xでは@SpringBootTest
+        (webEnvironment=RANDOM_PORT)だけではTestRestTemplate Beanが
+        自動構成されず、@AutoConfigureTestRestTemplateの明示指定が必要に
+        なっていたため追加。さらにTestRestTemplateTestAutoConfigurationが
+        要求するorg.springframework.boot.restclient.RestTemplateBuilderが
+        クラスパスに存在せずNoClassDefFoundErrorとなっていたため、
+        build.gradleにtestImplementation 'org.springframework.boot:
+        spring-boot-restclient' を追加。
+     c. AsyncTaskExecutionControllerTest の5件が、parameters省略時の
+        Mockitoスタブ不一致（eq(Collections.emptyMap())に対し実引数がnull）
+        で失敗。承認済みテスト計画（03_test-plan.md AC-09行）が
+        「parameters省略時は空Mapとして扱いServiceに渡す」ことを要求している
+        ことを確認し、AsyncTaskExecutionController.executeAsync()で
+        request.parameters()がnullの場合にMap.of()へ正規化する実装を追加
+        （プロダクションコードの不具合と判断し、テストは変更しなかった）。
+     d. AsyncTaskTrackingIntegrationTest の1件が、Spring Framework 7で
+        HttpStatus.UNPROCESSABLE_ENTITYが非推奨化され、TestRestTemplate
+        経由のレスポンスでは実際の生コードからHttpStatus.valueOf(422)で
+        再構築される際に別定数UNPROCESSABLE_CONTENTへ正規化されるため
+        既存のenum比較assertが失敗。意図（同期APIが422を返すこと）を保ちつつ
+        ライブラリ側のenum改名に依存しないよう、ステータスコード比較を
+        .value()による数値比較（422）に変更した。
+  3. ./gradlew test --no-daemon を再実行し、全74件成功（BUILD SUCCESSFUL）を確認。
+  4. 上記修正をclaude/process-tracking-bash-polling-cs2bbnブランチにコミット・push。
+
+備考:
+  従前の実装レビュー（04_implementation-review.md）は目視照合のみに基づく「承認」
+  であったが、実際にビルド・テストを実行した結果、プロダクションコード1件
+  （AsyncTaskExecutionControllerのparameters正規化漏れ）とテストコード起因の
+  環境差分2件（Spring Boot 4.x移行に伴うimport/アノテーション要件変更、
+  Spring Framework 7のHttpStatus enum改名）が判明し、修正した。
+
+変更ファイル:
+  build.gradle
+  gradlew（実行権限付与）
+  src/main/java/com/example/demo/task/async/AsyncTaskExecutionController.java
+  src/test/java/com/example/demo/task/async/AsyncTaskTrackingIntegrationTest.java
