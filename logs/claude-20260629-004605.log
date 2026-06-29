@@ -1,0 +1,80 @@
+日時: 2026-06-29 00:46:05
+指摘内容: 処理状況を管理する仕組みを設け、bashから呼ばれたら処理をトラッキングするためのキーを返し、
+bashからポーリングして処理状況を確認し、完了したら処理結果をbashが取得する仕組みを追加してほしい。
+あわせてbashスクリプトを作成し、複数の入力ファイル・複数の出力ファイルを渡すための仕様も決めてほしい
+（ファイルはローカルパス内に存在することを前提として良い）。
+
+実施内容:
+  /feature-dev-process スキルに従い、機能名 `async-task-tracking` として以下の工程を順に実施した。
+  1. 方式検討（method-investigator）: トラッキングキー生成方式・状態管理方式・ポーリング方式の
+     複数案を比較し、UUIDキー＋インメモリConcurrentHashMap状態ストア＋Spring @Async による
+     非同期実行方式を採用。docs/async-task-tracking/01_method-study.md として作成、
+     phase-reviewerでレビューし承認。
+  2. 設計（designer）: 採用方式に基づき、AsyncTaskExecutionService/AsyncTaskExecutionStateStore/
+     AsyncTaskRecord/AsyncTaskExecutionController等のクラス構成、エンドポイント
+     （POST /internal/tasks/execute-async, GET /internal/tasks/{taskId}）、エラーハンドリング方針
+     （非同期APIは業務失敗時も常にHTTP 200+status=FAILEDを返し、同期APIの422とは異なる）、
+     保持期限切れレコードの削除スケジューラ等を docs/async-task-tracking/02_design.md として作成、
+     phase-reviewerでレビューし承認。
+  3. テスト計画（test-engineer）: 設計書の全分岐（A0a〜A15, B1〜B6, C0a〜C8, D1〜D3、計36分岐）に
+     対するC1網羅のテストケース51件（必須）+1件（任意、結合シナリオIG-04）を
+     docs/async-task-tracking/03_test-plan.md として作成。phase-reviewerによる初回レビューで
+     「要修正」（分岐総数の誤り、A1専用ケース不足）の指摘を受け、implementerでの対応後に再レビューし承認。
+  4. 実装（implementer）: プロダクションコード一式
+     （src/main/java/com/example/demo/task/async/ 配下のサービス・状態ストア・レコード・
+     コントローラ・保持期限削除スケジューラ、dto配下の新規DTO3件、exception配下の新規例外2件と
+     GlobalExceptionHandlerへのハンドラ3件追加）を実装。
+     あわせて、非同期タスク実行APIをbashから呼び出し、トラッキングキー受け取り→ポーリング→
+     結果取得を行うbashスクリプト（複数入力ファイル・複数出力ファイルの受け渡しに対応）を作成。
+  5. テストコード実装（test-engineer、本セッションで実施）: テスト計画の全52ケースIDに対応する
+     テストコードをID単位で漏れなく実装。
+       - AsyncTaskExecutionStateStoreTest.java（SS-01〜04）
+       - AsyncTaskRetentionSchedulerTest.java（RT-01〜04）
+       - AsyncTaskExecutionServiceAcceptTest.java（AS-01〜07、不具合修正含む）
+       - AsyncTaskExecutionServiceExecuteAsyncTest.java（AE-01〜07）
+       - AsyncTaskExecutionServiceGetStatusTest.java（GS-01〜02）
+       - AsyncTaskExecutionControllerTest.java（AC-00〜12, GC-01〜02, GS-03〜06に拡張）
+       - GlobalExceptionHandlerAsyncTaskTest.java（EH-A01〜04）
+       - AsyncTaskTrackingIntegrationTest.java（IG-01〜04、@SpringBootTest+TestRestTemplateによる
+         実アプリケーションコンテキストでの結合シナリオ。同期API422 vs 非同期API200+FAILEDの
+         相違点を含む）
+     なお、本セッションの実行環境にはJava 25ツールチェイン・テスト依存JARが存在せず
+     ./gradlew compileJava/testが実行不可であったため、コンパイル・テスト実行による検証はできず、
+     既存の確認済みファイルとの目視照合（import経路・メソッドシグネチャ・production codeとの
+     整合性）により正確性を担保した。
+  6. 実装レビュー（phase-reviewer）: プロダクションコード・bashスクリプト・テストコード8ファイルの
+     差分を、設計書・テスト計画との整合性、テストケースID単位のカバレッジ漏れの有無、
+     コード品質の観点でレビュー。結論「承認」。
+     docs/async-task-tracking/reviews/04_implementation-review.md として記録。
+
+  全コミットを claude/process-tracking-bash-polling-cs2bbn ブランチにpushした。
+
+変更ファイル:
+  docs/async-task-tracking/01_method-study.md
+  docs/async-task-tracking/02_design.md
+  docs/async-task-tracking/03_test-plan.md
+  docs/async-task-tracking/reviews/01_method-study-review.md
+  docs/async-task-tracking/reviews/02_design-review.md
+  docs/async-task-tracking/reviews/03_test-plan-review.md
+  docs/async-task-tracking/reviews/04_implementation-review.md
+  src/main/java/com/example/demo/task/async/AsyncTaskExecutionService.java
+  src/main/java/com/example/demo/task/async/AsyncTaskExecutionStateStore.java
+  src/main/java/com/example/demo/task/async/AsyncTaskRecord.java
+  src/main/java/com/example/demo/task/async/AsyncTaskStatus.java
+  src/main/java/com/example/demo/task/async/AsyncTaskExecutionController.java
+  src/main/java/com/example/demo/task/async/AsyncTaskRetentionScheduler.java
+  src/main/java/com/example/demo/task/dto/AsyncTaskExecutionRequest.java
+  src/main/java/com/example/demo/task/dto/AsyncTaskExecutionAcceptedResponse.java
+  src/main/java/com/example/demo/task/dto/AsyncTaskStatusResponse.java
+  src/main/java/com/example/demo/task/exception/AsyncTaskNotFoundException.java
+  src/main/java/com/example/demo/task/exception/AsyncInputFileNotFoundException.java
+  src/main/java/com/example/demo/task/exception/GlobalExceptionHandler.java
+  scripts/（非同期タスク実行用bashスクリプト）
+  src/test/java/com/example/demo/task/async/AsyncTaskExecutionStateStoreTest.java
+  src/test/java/com/example/demo/task/async/AsyncTaskRetentionSchedulerTest.java
+  src/test/java/com/example/demo/task/async/AsyncTaskExecutionServiceAcceptTest.java
+  src/test/java/com/example/demo/task/async/AsyncTaskExecutionServiceExecuteAsyncTest.java
+  src/test/java/com/example/demo/task/async/AsyncTaskExecutionServiceGetStatusTest.java
+  src/test/java/com/example/demo/task/async/AsyncTaskExecutionControllerTest.java
+  src/test/java/com/example/demo/task/exception/GlobalExceptionHandlerAsyncTaskTest.java
+  src/test/java/com/example/demo/task/async/AsyncTaskTrackingIntegrationTest.java
